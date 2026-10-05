@@ -39,6 +39,14 @@ def lambda_handler(event, context):
         logger.info("[RESET] No email for user, skipping: %s", username)
         return event
 
+    # Set by the SES event delivery tracker after repeated failed deliveries
+    if (attrs.get("custom:emailBlocked") or "").lower() == "true":
+        logger.info(
+            "[RESET] Email blocked after repeated failed deliveries, skipping: %s",
+            username
+        )
+        return event
+
     try:
         send_reset_email(email, render_email(attrs, username))
         logger.info("[RESET] Password reset email sent to user: %s", username)

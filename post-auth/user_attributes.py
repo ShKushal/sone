@@ -10,6 +10,13 @@ cognito = boto3.client("cognito-idp")
 USER_OPERATION_ATTRIBUTE = "custom:userOperation"
 INVITATION_SENT = "INVITATION_SENT"
 
+# Set by the SES event delivery tracker after repeated failed deliveries
+EMAIL_BLOCKED_ATTRIBUTE = "custom:emailBlocked"
+
+
+def is_email_blocked(attrs):
+    return (attrs.get(EMAIL_BLOCKED_ATTRIBUTE) or "").lower() == "true"
+
 
 def should_send_confirmation(attrs):
     user_operation = attrs.get(USER_OPERATION_ATTRIBUTE, "")

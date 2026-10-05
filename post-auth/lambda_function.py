@@ -27,6 +27,7 @@ from confirmation_email import render_email, send_confirmation_email
 from invocation_logging import log_invocation
 from user_attributes import (
     clear_user_operation,
+    is_email_blocked,
     last_login_update,
     should_send_confirmation,
     update_user_attributes,
@@ -55,7 +56,15 @@ def lambda_handler(event, context):
     clear_operation = False
 
     try:
-        if should_send_confirmation(attrs):
+        if should_send_confirmation(attrs) and is_email_blocked(attrs):
+            # Keep custom:userOperation so the email is sent on the
+            # first login after the helpdesk unblocks the user
+            logger.info(
+                "Confirmation email blocked after repeated failed deliveries, "
+                "not sent for user: %s",
+                username
+            )
+        elif should_send_confirmation(attrs):
             send_confirmation_email(attrs["email"], render_email(attrs, username))
             # Clear the operation only after the email was sent successfully
             clear_operation = True

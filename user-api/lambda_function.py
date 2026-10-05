@@ -368,6 +368,11 @@ def update_user(username, updates, triggered_by=''):
                 'Value': str(value)
             })
 
+    # a new email address starts with a clean delivery history
+    if 'mail' in updates:
+        cognito_attrs.append({ 'Name': FAIL_COUNT_ATTRIBUTE, 'Value': '0' })
+        cognito_attrs.append({ 'Name': BLOCKED_ATTRIBUTE,      'Value': 'false' })
+
     if cognito_attrs:
         try:
             cognito.admin_update_user_attributes(
@@ -424,6 +429,33 @@ def delete_user(username):
     except Exception as e:
         errors.append(f"Cognito error: {str(e)}")
     return { 'userName': username, 'success': len(errors) == 0, 'errors': errors }
+
+# -------------------------------------------------------
+# Email blocked after repeated failed deliveries — set by the SES
+# event delivery tracker, cleared by POST .../email-unblock
+# -------------------------------------------------------
+FAIL_COUNT_ATTRIBUTE = 'custom:emailFailCount'
+BLOCKED_ATTRIBUTE      = 'custom:emailBlocked'
+
+def is_email_blocked(attrs):
+    return (attrs.get(BLOCKED_ATTRIBUTE) or '').lower() == 'true'
+
+def unblock_email(username, triggered_by=''):
+    try:
+        cognito.admin_update_user_attributes(
+            UserPoolId=USER_POOL_ID,
+            Username=username,
+            UserAttributes=[
+                { 'Name': FAIL_COUNT_ATTRIBUTE, 'Value': '0' },
+                { 'Name': BLOCKED_ATTRIBUTE,      'Value': 'false' },
+            ]
+        )
+        print(f"[EMAIL] Unblocked: {username} by {triggered_by}")
+        return { 'userName': username, 'success': True }
+    except cognito.exceptions.UserNotFoundException:
+        return { 'userName': username, 'success': False, 'errors': ['User not found'] }
+    except Exception as e:
+        return { 'userName': username, 'success': False, 'errors': [str(e)] }
 
 # -------------------------------------------------------
 # Render password reset email — same layout as the other
@@ -499,6 +531,17 @@ def reset_user_password(username, triggered_by=''):
         user  = get_user(username)
         attrs = user['attributes'] if user else {}
         email = attrs.get('email', '')
+
+        # no email after repeated failed deliveries (custom:emailBlocked)
+        if is_email_blocked(attrs):
+            print(f"[EMAIL] Blocked after repeated failed deliveries, not sent: {username}")
+            return {
+                'userName':     username,
+                'success':      True,
+                'emailSent':    False,
+                'emailBlocked': True,
+                'message':      'New password set — email blocked after repeated failed deliveries'
+            }
 
         email_sent = False
         if email:
@@ -610,6 +653,16 @@ def lambda_handler(event, context):
         triggered_by = body.get('triggeredBy', '')
         result = reset_user_password(username, triggered_by)
         return resp(200 if result['success'] else 500, result)
+
+    # POST /users/{username}/email-unblock
+    elif method == 'POST' and path == '/users/{username}/email-unblock':
+        if not username:
+            return resp(400, { 'error': 'username is required' })
+        triggered_by = body.get('triggeredBy', '')
+        result = unblock_email(username, triggered_by)
+        if result['success']:
+            return resp(200, result)
+        return resp(404 if result['errors'] == ['User not found'] else 500, result)
 
     # GET /users/{username}/email-logs
     elif method == 'GET' and path == '/users/{username}/email-logs':

@@ -37,6 +37,9 @@ logger.setLevel(logging.INFO)
 
 INVITATION_TRIGGER = "CustomMessage_AdminCreateUser"
 
+# Set by the SES event delivery tracker after repeated failed deliveries
+EMAIL_BLOCKED_ATTRIBUTE = "custom:emailBlocked"
+
 # OTP triggers -> (subject, template)
 OTP_EMAILS = {
     "CustomMessage_Authentication": (
@@ -61,6 +64,9 @@ def lambda_handler(event, context):
         trigger_source
     )
 
+    if trigger_source == INVITATION_TRIGGER or trigger_source in OTP_EMAILS:
+        _reject_if_email_blocked(event)
+
     if trigger_source == INVITATION_TRIGGER:
         return _handle_invitation(event)
 
@@ -74,6 +80,31 @@ def lambda_handler(event, context):
         trigger_source
     )
     return event
+
+
+class EmailBlockedError(Exception):
+    pass
+
+
+def _reject_if_email_blocked(event):
+    """
+    custom:emailBlocked is set by the SES event delivery tracker after
+    repeated failed deliveries. A Custom Message trigger can't cancel
+    the email, so it raises: Cognito sends nothing and the action
+    (sign-in OTP, forgot password, invitation) fails.
+    """
+    attrs = event.get("request", {}).get("userAttributes", {})
+
+    if (attrs.get(EMAIL_BLOCKED_ATTRIBUTE) or "").lower() != "true":
+        return
+
+    logger.warning(
+        "[BLOCKED] Email delivery blocked for user: %s, trigger: %s",
+        event.get("userName"),
+        event.get("triggerSource")
+    )
+
+    raise EmailBlockedError("Email delivery is blocked for this user")
 
 
 def _handle_otp(event, subject, template):

@@ -4,6 +4,8 @@ import os
 import time
 from datetime import datetime
 
+from delivery_tracker import track_ses_event
+
 dynamodb   = boto3.resource('dynamodb', region_name=os.environ.get('REGION', 'ap-southeast-1'))
 email_logs = dynamodb.Table(os.environ.get('TABLE_NAME', 'CognitoEmailLogs'))
 
@@ -42,6 +44,10 @@ def lambda_handler(event, context):
                     }
                 )
                 print(f"[EMAIL LOG] {event_type} → {email} → {subject}")
+
+            # Count consecutive failed deliveries per Cognito user and
+            # set custom:emailBlocked at the threshold. Never raises.
+            track_ses_event(message)
 
         except Exception as e:
             print(f"[EMAIL LOG] Error: {e}")
