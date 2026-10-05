@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { getApiHeaders }               from '../../hooks/useAuth';
 import { fetchAuthSession }            from 'aws-amplify/auth';
 
@@ -18,6 +18,7 @@ const DELIVERY_POLL_MS   = 3000;    // how often to re-check
 const DELIVERY_WATCH_MS  = 90000;   // stop waiting for a result after this long
 const DELIVERY_SETTLE_MS = 8000;    // after a failure, a few more checks so the logger's counter update shows
 const CLOCK_SKEW_MS      = 5000;    // browser clock vs SES timestamps
+const REFRESH_MIN_MS     = 600;     // a manual refresh shows its loader at least this long, even when instant
 const DELIVERY_TERMINAL  = ['Delivery', 'Bounce', 'Complaint', 'Reject', 'RenderingFailure'];
 
 const DELIVERY_TEXT = {
@@ -152,22 +153,53 @@ function ConfirmDialog({ title, body, confirmLabel, danger, onConfirm, onCancel 
 function EmailLogs({ username, refresh, onLoaded, onManualRefresh }) {
   const [logs,    setLogs]    = useState([]);
   const [loading, setLoading] = useState(true);
+  const [refreshing,     setRefreshing]     = useState(false);   // a manual refresh is running
+  const [refreshFailed,  setRefreshFailed]  = useState(false);
+  const [updatedAt,      setUpdatedAt]      = useState(null);    // when the history was last read
   const firstLoad = useRef(true);   // only the first load shows "Loading..." — re-checks update quietly
   const latest    = useRef(0);      // a slow response must not overwrite a newer one
+  const alive     = useRef(true);
 
   useEffect(() => {
+    alive.current = true;
+    return () => { alive.current = false; };
+  }, []);
+
+  // one read of the history; resolves false if it failed (so the caller can say so)
+  const loadLogs = useCallback(async () => {
     const mine = ++latest.current;
     if (firstLoad.current) setLoading(true);
-    apiGetEmailLogs(username).then(result => {
-      if (mine !== latest.current) return;
-      if (result !== null) {
-        setLogs(result);
-        if (onLoaded) onLoaded(result);
-      }
-      firstLoad.current = false;
-      setLoading(false);
-    });
-  }, [username, refresh]);
+    const result = await apiGetEmailLogs(username);
+    if (!alive.current || mine !== latest.current) return true;   // a newer read took over
+    firstLoad.current = false;
+    setLoading(false);
+    if (result === null) return false;
+    setLogs(result);
+    setUpdatedAt(new Date());
+    if (onLoaded) onLoaded(result);
+    return true;
+  }, [username, onLoaded]);
+
+  // re-reads when the user changes or the parent bumps `refresh`
+  useEffect(() => { loadLogs(); }, [loadLogs, refresh]);
+
+  // The Refresh button: locked and showing a loader until BOTH the user and the history
+  // are re-read, and visible for at least REFRESH_MIN_MS so an instant refresh is still noticed.
+  const manualRefresh = async () => {
+    if (refreshing) return;
+    setRefreshing(true);
+    setRefreshFailed(false);
+    const started = Date.now();
+    const [userOk, logsOk] = await Promise.all([
+      Promise.resolve(onManualRefresh ? onManualRefresh() : true).catch(() => false),
+      loadLogs(),
+    ]);
+    const rest = REFRESH_MIN_MS - (Date.now() - started);
+    if (rest > 0) await new Promise(resolve => setTimeout(resolve, rest));
+    if (!alive.current) return;
+    setRefreshFailed(userOk === false || !logsOk);
+    setRefreshing(false);
+  };
 
   const eventColor = type => {
     if (['Delivery', 'Send'].includes(type)) return 'var(--green)';
@@ -186,7 +218,24 @@ function EmailLogs({ username, refresh, onLoaded, onManualRefresh }) {
       <div className="logs-heading">
         <h3>Email History</h3>
         {onManualRefresh && (
-          <button className="btn-link" onClick={onManualRefresh}>↻ Refresh</button>
+          <div className="logs-refresh">
+            {!refreshing && refreshFailed && (
+              <span className="logs-updated failed">Refresh failed — try again</span>
+            )}
+            {!refreshing && !refreshFailed && updatedAt && (
+              <span className="logs-updated">Updated {updatedAt.toLocaleTimeString()}</span>
+            )}
+            <button
+              className="btn-link"
+              onClick={manualRefresh}
+              disabled={refreshing}
+              aria-busy={refreshing}
+            >
+              {refreshing
+                ? <><span className="spinner" aria-hidden="true" />Refreshing…</>
+                : '↻ Refresh'}
+            </button>
+          </div>
         )}
       </div>
       {loading && (
@@ -200,7 +249,7 @@ function EmailLogs({ username, refresh, onLoaded, onManualRefresh }) {
         </p>
       )}
       {!loading && logs.length > 0 && (
-        <div className="reset-logs">
+        <div className={`reset-logs${refreshing ? ' refreshing' : ''}`}>
           {logs.map((log, i) => (
             <div key={i} className="reset-log">
               <span className="log-status" style={{ color: eventColor(log.eventType) }}>
@@ -288,8 +337,6 @@ function UserCard({ user, onRefresh }) {
     setDelivery('waiting');
     setWatch({ since, until: Date.now() + DELIVERY_WATCH_MS, result: null });
   };
-
-  const refreshAll = () => { onRefresh(); setEmailRefresh(r => r + 1); };
 
   const attrs     = user.attributes || {};
   const isEnabled = user.enabled;
@@ -564,7 +611,7 @@ function UserCard({ user, onRefresh }) {
           username={user.userName}
           refresh={emailRefresh}
           onLoaded={setLatestLogs}
-          onManualRefresh={refreshAll}
+          onManualRefresh={onRefresh}
         />
       </div>
     </>
@@ -710,13 +757,15 @@ export default function HelpdeskPage() {
     if (!silent) { setLoadingUser(true); setError(''); }
     try {
       const result = await apiSearchUser(username);
-      if (latestRequest.current !== username) return;   // switched to another user meanwhile
+      if (latestRequest.current !== username) return true;   // switched to another user meanwhile
       setSelectedUser(result);
+      return true;
     } catch (e) {
-      if (latestRequest.current !== username) return;
+      if (latestRequest.current !== username) return true;
       // a failed background re-check keeps what is on screen; a failed load shows the error
       if (silent) console.warn('Background refresh failed:', e.message);
       else        setError(e.message);
+      return false;
     } finally {
       if (!silent && latestRequest.current === username) setLoadingUser(false);
     }
@@ -732,8 +781,10 @@ export default function HelpdeskPage() {
     await loadUser(username);
   };
 
+  // resolves true/false so the Refresh button can say whether the re-read worked
   const handleRefresh = async () => {
-    if (selectedUser) await loadUser(selectedUser.userName, { silent: true });
+    if (!selectedUser) return true;
+    return loadUser(selectedUser.userName, { silent: true });
   };
 
   return (

@@ -1259,3 +1259,40 @@ body {
 }
 
 .btn-link:hover { text-decoration: underline; }
+
+/* Email History — Refresh button feedback */
+.logs-refresh {
+  display:     flex;
+  align-items: center;
+  gap:         10px;
+}
+
+.logs-updated {
+  font-size: 11.5px;
+  color:     var(--grey-400);
+}
+
+.logs-updated.failed { color: var(--red); }
+
+.btn-link:disabled {
+  cursor:          default;
+  text-decoration: none;
+  opacity:         .75;
+}
+
+.spinner {
+  display:        inline-block;
+  width:          11px;
+  height:         11px;
+  margin-right:   5px;
+  border:         2px solid var(--blue-light);
+  border-top-color: var(--blue);
+  border-radius:  50%;
+  vertical-align: -1px;
+  animation:      azg-spin .7s linear infinite;
+}
+
+@keyframes azg-spin { to { transform: rotate(360deg); } }
+
+.reset-logs { transition: opacity 120ms; }
+.reset-logs.refreshing { opacity: .5; }
