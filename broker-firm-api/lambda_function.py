@@ -1,6 +1,7 @@
 import boto3
 import json
 import os
+import re
 import time
 from datetime import datetime
 
@@ -12,6 +13,62 @@ TABLE_NAME     = os.environ.get('TABLE_NAME',     'BrokerFirms')
 REGION         = os.environ.get('REGION',         'ap-southeast-1')
 DELETE_ENABLED = os.environ.get('DELETE_ENABLED', 'false').lower() == 'true'
 
+# errorCode → HTTP status. Anything not listed here is a 500.
+ERROR_STATUS = {
+    'BROKER_FIRM_EXISTS':    409,
+    'BROKER_FIRM_NOT_FOUND': 404,
+    'BAD_REQUEST':           400,
+}
+
+# Broker firm payload fields — a caller must send each of these as a string
+FIRM_STRING_FIELDS = ('uen', 'name', 'displayName', 'description', 'address', 'country')
+
+# Update bodies become DynamoDB expression placeholders (#key / :key),
+# so every key must be a plain identifier
+FIELD_NAME_PATTERN = re.compile(r'^[A-Za-z0-9_]+$')
+
+# -------------------------------------------------------
+# Request validation helpers
+# -------------------------------------------------------
+# Raised for a malformed request; lambda_handler turns it into a 400
+class BadRequest(Exception):
+    pass
+
+def bad_request(errors, **extra):
+    return { **extra, 'success': False, 'errorCode': 'BAD_REQUEST', 'errors': errors }
+
+def not_found(uen, message):
+    return {
+        'uen':       uen,
+        'success':   False,
+        'errorCode': 'BROKER_FIRM_NOT_FOUND',
+        'errors':    [message]
+    }
+
+def validate_string_fields(payload):
+    return [
+        f'{field} must be a string'
+        for field in FIRM_STRING_FIELDS
+        if field in payload and not isinstance(payload[field], str)
+    ]
+
+def parse_body(event):
+    raw = event.get('body')
+    if not raw:
+        return {}
+    try:
+        body = json.loads(raw)
+    except ValueError:
+        raise BadRequest('Request body must be valid JSON')
+    if not isinstance(body, dict):
+        raise BadRequest('Request body must be a JSON object')
+    return body
+
+def respond_with(result, success_status=200):
+    if result['success']:
+        return resp(success_status, result)
+    return resp(ERROR_STATUS.get(result.get('errorCode'), 500), result)
+
 cognito  = boto3.client('cognito-idp', region_name=REGION)
 dynamodb = boto3.resource('dynamodb', region_name=REGION)
 table    = dynamodb.Table(TABLE_NAME)
@@ -21,6 +78,11 @@ table    = dynamodb.Table(TABLE_NAME)
 # -------------------------------------------------------
 def create_broker_firm(firm):
     errors = []
+
+    # a wrong-typed field would crash on .strip() / be rejected by Cognito — reject it up front
+    problems = validate_string_fields(firm)
+    if problems:
+        return bad_request(problems)
 
     uen = firm.get('uen', '').strip()
 
@@ -34,10 +96,16 @@ def create_broker_firm(firm):
     except cognito.exceptions.GroupExistsException:
         print(f"Cognito group exists: {uen} — skipping")
         return {
-            'uen':     uen,
-            'success': False,
-            'errors':  ['Broker firm already exists']
+            'uen':       uen,
+            'success':   False,
+            'errorCode': 'BROKER_FIRM_EXISTS',
+            'errors':    ['Broker firm already exists']
         }
+    except cognito.exceptions.InvalidParameterException as e:
+        # e.g. a UEN with whitespace — stop here so no orphan DynamoDB record is written
+        message = e.response['Error']['Message']
+        print(f"Invalid parameter for {uen}: {message}")
+        return bad_request([message], uen=uen)
     except Exception as e:
         errors.append(f"Cognito error: {str(e)}")
 
@@ -80,7 +148,13 @@ def bulk_create_broker_firms(firms):
             print(f"Rate limit pause after {i}/{total} firms")
             time.sleep(1)
 
-        uen = firm.get('uen', '').strip()
+        raw_uen = firm.get('uen', '')
+        uen     = raw_uen.strip() if isinstance(raw_uen, str) else ''
+
+        problems = validate_string_fields(firm)
+        if problems:
+            failed.append({ 'uen': uen or 'unknown', 'errors': problems })
+            continue
 
         if not uen:
             failed.append({ 'uen': 'unknown', 'errors': ['uen is required'] })
@@ -108,7 +182,7 @@ def bulk_create_broker_firms(firms):
 
         if result['success']:
             success.append(uen)
-        elif result['errors'] and result['errors'][0] == 'Broker firm already exists':
+        elif result.get('errorCode') == 'BROKER_FIRM_EXISTS':
             skipped.append(uen)
         else:
             failed.append({ 'uen': uen, 'errors': result['errors'] })
@@ -146,6 +220,16 @@ def update_broker_firm(uen, updates):
     updates.pop('uen',       None)
     updates.pop('UEN',       None)
     updates.pop('createdAt', None)
+
+    problems  = validate_string_fields(updates)
+    problems += [
+        f"'{key}' is not a valid field name"
+        for key in updates
+        if not FIELD_NAME_PATTERN.match(key)
+    ]
+    if problems:
+        return bad_request(problems, uen=uen)
+
     updates['updatedAt'] = datetime.utcnow().isoformat()
 
     try:
@@ -162,7 +246,7 @@ def update_broker_firm(uen, updates):
         )
         print(f"DynamoDB updated: {uen}")
     except table.meta.client.exceptions.ConditionalCheckFailedException:
-        errors.append(f"Broker firm not found: {uen}")
+        return not_found(uen, f"Broker firm not found: {uen}")
     except Exception as e:
         errors.append(f"DynamoDB error: {str(e)}")
 
@@ -187,7 +271,8 @@ def update_broker_firm(uen, updates):
 # Delete
 # -------------------------------------------------------
 def delete_broker_firm(uen):
-    errors = []
+    errors  = []
+    missing = False
 
     try:
         cognito.delete_group(
@@ -207,26 +292,36 @@ def delete_broker_firm(uen):
         )
         print(f"DynamoDB record deleted: {uen}")
     except table.meta.client.exceptions.ConditionalCheckFailedException:
+        missing = True
         errors.append(f"Broker firm not found in DynamoDB: {uen}")
     except Exception as e:
         errors.append(f"DynamoDB error: {str(e)}")
 
-    return {
+    result = {
         'uen':     uen,
         'success': len(errors) == 0,
         'errors':  errors
     }
+    # only a 404 when "not found" is the sole problem
+    if missing and len(errors) == 1:
+        result['errorCode'] = 'BROKER_FIRM_NOT_FOUND'
+    return result
 
 # -------------------------------------------------------
 # Lambda handler
 # -------------------------------------------------------
 def lambda_handler(event, context):
     print('Event:', json.dumps(event))
+    try:
+        return route(event)
+    except BadRequest as e:
+        return resp(400, { 'success': False, 'errorCode': 'BAD_REQUEST', 'errors': [str(e)] })
 
+def route(event):
     route_key       = event.get('routeKey', 'GET /broker-firms')
     method          = route_key.split(' ')[0]
     path            = route_key.split(' ')[1]
-    body            = json.loads(event.get('body') or '{}')
+    body            = parse_body(event)
     path_parameters = event.get('pathParameters') or {}
     uen             = path_parameters.get('brokerId')
 
@@ -239,6 +334,8 @@ def lambda_handler(event, context):
             return resp(400, { 'error': 'firms must be an array' })
         if len(firms) > 500:
             return resp(400, { 'error': 'maximum 500 firms per bulk request' })
+        if not all(isinstance(f, dict) for f in firms):
+            raise BadRequest('firms must be an array of objects')
         result = bulk_create_broker_firms(firms)
         return resp(200, result)
 
@@ -251,7 +348,7 @@ def lambda_handler(event, context):
         if not body.get('displayName'):
             return resp(400, { 'error': 'displayName is required' })
         result = create_broker_firm(body)
-        return resp(201 if result['success'] else 500, result)
+        return respond_with(result, 201)
 
     # GET /broker-firms
     elif method == 'GET' and path == '/broker-firms':
@@ -272,7 +369,7 @@ def lambda_handler(event, context):
         if not body:
             return resp(400, { 'error': 'No fields to update' })
         result = update_broker_firm(uen, body)
-        return resp(200 if result['success'] else 500, result)
+        return respond_with(result)
 
     # DELETE /broker-firms/{brokerId}
     elif method == 'DELETE' and path == '/broker-firms/{brokerId}':
@@ -281,7 +378,7 @@ def lambda_handler(event, context):
         if not uen:
             return resp(400, { 'error': 'uen is required' })
         result = delete_broker_firm(uen)
-        return resp(200 if result['success'] else 500, result)
+        return respond_with(result)
 
     return resp(400, { 'error': 'Invalid request' })
 

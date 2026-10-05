@@ -29,6 +29,75 @@ SES_CONFIGURATION_SET = os.environ.get('SES_CONFIGURATION_SET', '').strip()
 
 PLACEHOLDER_PATTERN = re.compile(r"\{\{(\w+)\}\}")
 
+# errorCode → HTTP status. Anything not listed here is a 500.
+ERROR_STATUS = {
+    'USER_EXISTS':    409,
+    'USER_NOT_FOUND': 404,
+    'BAD_REQUEST':    400,
+}
+
+# User payload fields — a caller must send each of these as a string
+USER_STRING_FIELDS = (
+    'userName', 'mail', 'givenName', 'sn', 'organisation', 'phoneNumber',
+    'frUnindexedString1', 'frIndexedString2', 'frUnindexedString5',
+)
+
+MAX_PAGE_SIZE = 60   # Cognito ListUsers maximum
+
+# -------------------------------------------------------
+# Request validation helpers
+# -------------------------------------------------------
+# Raised for a malformed request; lambda_handler turns it into a 400
+class BadRequest(Exception):
+    pass
+
+def bad_request(errors, **extra):
+    return { **extra, 'success': False, 'errorCode': 'BAD_REQUEST', 'errors': errors }
+
+def not_found(username):
+    return {
+        'userName':  username,
+        'success':   False,
+        'errorCode': 'USER_NOT_FOUND',
+        'errors':    ['User not found']
+    }
+
+def validate_string_fields(payload):
+    return [
+        f'{field} must be a string'
+        for field in USER_STRING_FIELDS
+        if field in payload and not isinstance(payload[field], str)
+    ]
+
+def parse_body(event):
+    raw = event.get('body')
+    if not raw:
+        return {}
+    try:
+        body = json.loads(raw)
+    except ValueError:
+        raise BadRequest('Request body must be valid JSON')
+    if not isinstance(body, dict):
+        raise BadRequest('Request body must be a JSON object')
+    return body
+
+def parse_limit(params, default=10):
+    raw = params.get('limit')
+    if raw is None:
+        return default
+    try:
+        limit = int(raw)
+    except (TypeError, ValueError):
+        raise BadRequest('limit must be a whole number')
+    if limit < 1:
+        raise BadRequest('limit must be at least 1')
+    return min(limit, MAX_PAGE_SIZE)
+
+def respond_with(result, success_status=200):
+    if result['success']:
+        return resp(success_status, result)
+    return resp(ERROR_STATUS.get(result.get('errorCode'), 500), result)
+
 cognito          = boto3.client('cognito-idp', region_name=REGION)
 dynamodb         = boto3.resource('dynamodb',  region_name=REGION)
 ses              = boto3.client('ses',         region_name=REGION)
@@ -107,6 +176,11 @@ def generate_password():
 def create_user(user):
     errors = []
 
+    # a wrong-typed field would crash on .strip() below — reject it up front
+    problems = validate_string_fields(user)
+    if problems:
+        return bad_request(problems)
+
     username             = user.get('userName',           '').strip()
     email                = user.get('mail',               '').strip()
     given_name           = user.get('givenName',          '').strip()
@@ -123,9 +197,9 @@ def create_user(user):
     is_active = fr_unindexed_string1.upper() == 'TRUE'
 
     if not username:
-        return { 'success': False, 'errors': ['userName is required'] }
+        return bad_request(['userName is required'])
     if not email:
-        return { 'success': False, 'errors': ['mail (email) is required'] }
+        return bad_request(['mail (email) is required'])
 
     try:
         cognito.admin_create_user(
@@ -166,9 +240,18 @@ def create_user(user):
                 print(f"Group assignment warning: {e}")
 
     except cognito.exceptions.UsernameExistsException:
-        return { 'userName': username, 'success': False, 'errors': ['User already exists'] }
+        return {
+            'userName':  username,
+            'success':   False,
+            'errorCode': 'USER_EXISTS',
+            'errors':    ['User already exists']
+        }
     except cognito.exceptions.TooManyRequestsException:
         return { 'userName': username, 'success': False, 'errors': ['Rate limit hit — will retry'] }
+    except cognito.exceptions.InvalidParameterException as e:
+        message = e.response['Error']['Message']
+        print(f"Invalid parameter for {username}: {message}")
+        return bad_request([message], userName=username)
     except Exception as e:
         errors.append(f"Cognito error: {str(e)}")
 
@@ -194,7 +277,8 @@ def bulk_create_users(users):
             print(f"Rate limit pause after {i}/{total} users")
             time.sleep(1)
 
-        username    = user.get('userName', '').strip()
+        raw_name    = user.get('userName', '')
+        username    = raw_name.strip() if isinstance(raw_name, str) else ''
         max_retries = 3
         result      = None
 
@@ -211,7 +295,7 @@ def bulk_create_users(users):
 
         if result['success']:
             success.append(username)
-        elif result['errors'] and result['errors'][0] == 'User already exists':
+        elif result.get('errorCode') == 'USER_EXISTS':
             skipped.append(username)
         else:
             failed.append({ 'userName': username, 'errors': result['errors'] })
@@ -321,6 +405,8 @@ def list_users_paginated(limit=10, pagination_token=None):
             'hasMore':   next_token is not None,
             'count':     len(users)
         }
+    except cognito.exceptions.InvalidParameterException:
+        raise BadRequest('paginationToken is not valid')
     except Exception as e:
         print(f"List users paginated error: {e}")
         return { 'users': [], 'nextToken': None, 'hasMore': False, 'count': 0 }
@@ -335,6 +421,10 @@ def update_user(username, updates, triggered_by=''):
     updates.pop('createdAt',    None)
     updates.pop('triggeredBy',  None)
 
+    problems = validate_string_fields(updates)
+    if problems:
+        return bad_request(problems, userName=username)
+
     if 'frUnindexedString1' in updates:
         is_active = updates['frUnindexedString1'].upper() == 'TRUE'
         try:
@@ -345,7 +435,7 @@ def update_user(username, updates, triggered_by=''):
                 cognito.admin_disable_user(UserPoolId=USER_POOL_ID, Username=username)
                 print(f"User disabled: {username}")
         except cognito.exceptions.UserNotFoundException:
-            return { 'userName': username, 'success': False, 'errors': ['User not found'] }
+            return not_found(username)
         except Exception as e:
             errors.append(f"Status update error: {str(e)}")
 
@@ -382,7 +472,11 @@ def update_user(username, updates, triggered_by=''):
             )
             print(f"Cognito user updated: {username}")
         except cognito.exceptions.UserNotFoundException:
-            return { 'userName': username, 'success': False, 'errors': ['User not found'] }
+            return not_found(username)
+        except cognito.exceptions.InvalidParameterException as e:
+            message = e.response['Error']['Message']
+            print(f"Invalid parameter for {username}: {message}")
+            return bad_request([message], userName=username)
         except Exception as e:
             errors.append(f"Cognito error: {str(e)}")
 
@@ -425,7 +519,7 @@ def delete_user(username):
         cognito.admin_delete_user(UserPoolId=USER_POOL_ID, Username=username)
         print(f"Cognito user deleted: {username}")
     except cognito.exceptions.UserNotFoundException:
-        return { 'userName': username, 'success': False, 'errors': ['User not found'] }
+        return not_found(username)
     except Exception as e:
         errors.append(f"Cognito error: {str(e)}")
     return { 'userName': username, 'success': len(errors) == 0, 'errors': errors }
@@ -453,7 +547,7 @@ def unblock_email(username, triggered_by=''):
         print(f"[EMAIL] Unblocked: {username} by {triggered_by}")
         return { 'userName': username, 'success': True }
     except cognito.exceptions.UserNotFoundException:
-        return { 'userName': username, 'success': False, 'errors': ['User not found'] }
+        return not_found(username)
     except Exception as e:
         return { 'userName': username, 'success': False, 'errors': [str(e)] }
 
@@ -556,7 +650,7 @@ def reset_user_password(username, triggered_by=''):
         }
 
     except cognito.exceptions.UserNotFoundException:
-        return { 'userName': username, 'success': False, 'errors': ['User not found'] }
+        return not_found(username)
     except cognito.exceptions.InvalidPasswordException as e:
         return { 'userName': username, 'success': False, 'errors': [f'Password policy violation: {str(e)}'] }
     except Exception as e:
@@ -583,11 +677,16 @@ def get_email_logs(username):
 # -------------------------------------------------------
 def lambda_handler(event, context):
     print('Event:', json.dumps(event))
+    try:
+        return route(event)
+    except BadRequest as e:
+        return resp(400, { 'success': False, 'errorCode': 'BAD_REQUEST', 'errors': [str(e)] })
 
+def route(event):
     route_key        = event.get('routeKey', 'GET /users')
     method           = route_key.split(' ')[0]
     path             = route_key.split(' ')[1]
-    body             = json.loads(event.get('body') or '{}')
+    body             = parse_body(event)
     path_parameters  = event.get('pathParameters') or {}
     query_parameters = event.get('queryStringParameters') or {}
     username         = unquote(path_parameters.get('username', ''))
@@ -601,6 +700,8 @@ def lambda_handler(event, context):
             return resp(400, { 'error': 'users must be an array' })
         if len(users) > 500:
             return resp(400, { 'error': 'maximum 500 users per bulk request' })
+        if not all(isinstance(u, dict) for u in users):
+            raise BadRequest('users must be an array of objects')
         result = bulk_create_users(users)
         return resp(200, result)
 
@@ -611,11 +712,11 @@ def lambda_handler(event, context):
         if not body.get('mail'):
             return resp(400, { 'error': 'mail (email) is required' })
         result = create_user(body)
-        return resp(201 if result['success'] else 500, result)
+        return respond_with(result, 201)
 
     # GET /users — paginated
     elif method == 'GET' and path == '/users':
-        limit            = int(query_parameters.get('limit', 10))
+        limit            = parse_limit(query_parameters)
         pagination_token = query_parameters.get('paginationToken')
         result           = list_users_paginated(limit, pagination_token)
         return resp(200, result)
@@ -635,7 +736,7 @@ def lambda_handler(event, context):
             return resp(400, { 'error': 'No fields to update' })
         triggered_by = body.pop('triggeredBy', '')
         result = update_user(username, body, triggered_by)
-        return resp(200 if result['success'] else 500, result)
+        return respond_with(result)
 
     # DELETE /users/{username}
     elif method == 'DELETE' and path == '/users/{username}':
@@ -644,7 +745,7 @@ def lambda_handler(event, context):
         if not username:
             return resp(400, { 'error': 'username is required' })
         result = delete_user(username)
-        return resp(200 if result['success'] else 500, result)
+        return respond_with(result)
 
     # POST /users/{username}/reset-password
     elif method == 'POST' and path == '/users/{username}/reset-password':
@@ -652,7 +753,7 @@ def lambda_handler(event, context):
             return resp(400, { 'error': 'username is required' })
         triggered_by = body.get('triggeredBy', '')
         result = reset_user_password(username, triggered_by)
-        return resp(200 if result['success'] else 500, result)
+        return respond_with(result)
 
     # POST /users/{username}/email-unblock
     elif method == 'POST' and path == '/users/{username}/email-unblock':
@@ -660,9 +761,7 @@ def lambda_handler(event, context):
             return resp(400, { 'error': 'username is required' })
         triggered_by = body.get('triggeredBy', '')
         result = unblock_email(username, triggered_by)
-        if result['success']:
-            return resp(200, result)
-        return resp(404 if result['errors'] == ['User not found'] else 500, result)
+        return respond_with(result)
 
     # GET /users/{username}/email-logs
     elif method == 'GET' and path == '/users/{username}/email-logs':
