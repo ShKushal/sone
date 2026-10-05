@@ -1,0 +1,28 @@
+{
+  "name": "azg-admin-portal",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "@aws-amplify/ui-react": "^6.15.6",
+    "aws-amplify": "^6.22.1",
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0",
+    "react-router-dom": "^6.30.6",
+    "react-scripts": "5.0.1"
+  },
+  "scripts": {
+    "start": "react-scripts start",
+    "build": "react-scripts build",
+    "test": "react-scripts test"
+  },
+  "browserslist": {
+    "production": [
+      ">0.2%",
+      "not dead",
+      "not op_mini all"
+    ],
+    "development": [
+      "last 1 chrome version"
+    ]
+  }
+}
