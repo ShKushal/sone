@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { getApiHeaders }               from '../../hooks/useAuth';
 import { fetchAuthSession }            from 'aws-amplify/auth';
 
@@ -10,6 +10,22 @@ const PER_PAGE = 10;
 // blocking itself is enforced by that Lambda. Keep the two in step until this moves
 // to global config.
 const EMAIL_FAIL_LIMIT = 5;
+
+// A bounce is not known when the reset call returns: SES -> SNS -> logger Lambda ->
+// email history + Cognito attributes takes a few seconds. After a reset the card keeps
+// re-checking for a while instead of showing a stale state until someone refreshes.
+const DELIVERY_POLL_MS   = 3000;    // how often to re-check
+const DELIVERY_WATCH_MS  = 90000;   // stop waiting for a result after this long
+const DELIVERY_SETTLE_MS = 8000;    // after a failure, a few more checks so the logger's counter update shows
+const CLOCK_SKEW_MS      = 5000;    // browser clock vs SES timestamps
+const DELIVERY_TERMINAL  = ['Delivery', 'Bounce', 'Complaint', 'Reject', 'RenderingFailure'];
+
+const DELIVERY_TEXT = {
+  waiting:   '⏳ Email sent — checking delivery status…',
+  delivered: '✅ Email delivered',
+  failed:    '❌ Email could not be delivered (bounced) — see Email delivery above',
+  timeout:   'No delivery result yet — it can take a little longer. Use ↻ Refresh to check again.',
+};
 
 // Email delivery state from the user's custom attributes. Cognito omits
 // attributes that were never set, so "missing" means not blocked, 0 failures.
@@ -101,10 +117,10 @@ async function apiGetEmailLogs(username) {
       `${API_URL}/users/${encodeURIComponent(username)}/email-logs`,
       { headers }
     );
-    if (!response.ok) return [];
+    if (!response.ok) return null;
     const data = await response.json();
     return data.logs || [];
-  } catch { return []; }
+  } catch { return null; }   // null = failed, so a background re-check keeps what is on screen
 }
 
 // -------------------------------------------------------
@@ -133,16 +149,24 @@ function ConfirmDialog({ title, body, confirmLabel, danger, onConfirm, onCancel 
 // -------------------------------------------------------
 // Email logs
 // -------------------------------------------------------
-function EmailLogs({ username, refresh }) {
+function EmailLogs({ username, refresh, onLoaded, onManualRefresh }) {
   const [logs,    setLogs]    = useState([]);
   const [loading, setLoading] = useState(true);
+  const firstLoad = useRef(true);   // only the first load shows "Loading..." — re-checks update quietly
+  const latest    = useRef(0);      // a slow response must not overwrite a newer one
 
   useEffect(() => {
-    setLoading(true);
-    apiGetEmailLogs(username)
-      .then(setLogs)
-      .catch(() => setLogs([]))
-      .finally(() => setLoading(false));
+    const mine = ++latest.current;
+    if (firstLoad.current) setLoading(true);
+    apiGetEmailLogs(username).then(result => {
+      if (mine !== latest.current) return;
+      if (result !== null) {
+        setLogs(result);
+        if (onLoaded) onLoaded(result);
+      }
+      firstLoad.current = false;
+      setLoading(false);
+    });
   }, [username, refresh]);
 
   const eventColor = type => {
@@ -159,7 +183,12 @@ function EmailLogs({ username, refresh }) {
 
   return (
     <div className="reset-history">
-      <h3>Email History</h3>
+      <div className="logs-heading">
+        <h3>Email History</h3>
+        {onManualRefresh && (
+          <button className="btn-link" onClick={onManualRefresh}>↻ Refresh</button>
+        )}
+      </div>
       {loading && (
         <p style={{ fontSize: 12, color: 'var(--grey-400)', padding: '8px 0' }}>
           Loading...
@@ -201,6 +230,67 @@ function UserCard({ user, onRefresh }) {
   const [emailRefresh, setEmailRefresh] = useState(0);
   const [confirm,      setConfirm]      = useState(null);
 
+  // waiting for the delivery result of a password-reset email
+  const [watch,      setWatch]      = useState(null);   // { since, until, result }
+  const [delivery,   setDelivery]   = useState(null);   // waiting | delivered | failed | timeout
+  const [latestLogs, setLatestLogs] = useState([]);
+  const watchRef     = useRef(null);
+  const onRefreshRef = useRef(onRefresh);
+  watchRef.current     = watch;
+  onRefreshRef.current = onRefresh;
+
+  // While waiting: re-read the user (the logger's failure count / block) and the email
+  // history every few seconds, until a result for this reset is in or time runs out.
+  const isWatching = watch !== null;
+  useEffect(() => {
+    if (!isWatching) return undefined;
+    const timer = setInterval(() => {
+      const w = watchRef.current;
+      if (!w) return;
+      if (Date.now() >= w.until) {
+        setWatch(null);
+        setDelivery(w.result || 'timeout');
+        return;
+      }
+      if (document.hidden) return;                  // nobody is looking — skip the request
+      onRefreshRef.current();
+      setEmailRefresh(r => r + 1);
+    }, DELIVERY_POLL_MS);
+    return () => clearInterval(timer);
+  }, [isWatching]);
+
+  // A result for THIS reset = a final delivery event newer than the click
+  useEffect(() => {
+    if (!watch || watch.result) return;
+    const hit = latestLogs.find(log =>
+      DELIVERY_TERMINAL.includes(log.eventType) &&
+      new Date(log.timestamp).getTime() >= watch.since - CLOCK_SKEW_MS
+    );
+    if (!hit) return;
+    const failed = hit.eventType !== 'Delivery';
+    setDelivery(failed ? 'failed' : 'delivered');
+    // delivered: stop on the next tick. failed: a few more checks so the counter update shows up.
+    setWatch(w => w && {
+      ...w,
+      result: failed ? 'failed' : 'delivered',
+      until:  failed ? Math.min(w.until, Date.now() + DELIVERY_SETTLE_MS) : Date.now(),
+    });
+  }, [latestLogs, watch]);
+
+  // the outcome line fades after a while (a timeout hint stays until the next action)
+  useEffect(() => {
+    if (!delivery || delivery === 'waiting' || delivery === 'timeout') return undefined;
+    const t = setTimeout(() => setDelivery(null), 20000);
+    return () => clearTimeout(t);
+  }, [delivery]);
+
+  const startWatch = (since) => {
+    setDelivery('waiting');
+    setWatch({ since, until: Date.now() + DELIVERY_WATCH_MS, result: null });
+  };
+
+  const refreshAll = () => { onRefresh(); setEmailRefresh(r => r + 1); };
+
   const attrs     = user.attributes || {};
   const isEnabled = user.enabled;
 
@@ -220,11 +310,13 @@ function UserCard({ user, onRefresh }) {
     setTimeout(() => setMessage(''), type === 'warning' ? 10000 : 3000);
   };
 
-  // fn may return { notice: { type, message } } to replace "<action> successful"
+  // fn may return { notice: { type, message } } to replace "<action> successful",
+  // and { watchDelivery: true } to keep checking for the email's delivery result
   const handle = async (action, fn) => {
     setConfirm(null);
     setLoading(action);
     setMessage('');
+    const startedAt = Date.now();
     try {
       const outcome = await fn();
       showMsg(
@@ -233,6 +325,7 @@ function UserCard({ user, onRefresh }) {
       );
       onRefresh();
       setEmailRefresh(r => r + 1);
+      if (outcome?.watchDelivery) startWatch(startedAt);
     } catch (e) {
       showMsg(e.message, 'error');
     } finally {
@@ -259,6 +352,9 @@ function UserCard({ user, onRefresh }) {
         return { notice: { type: 'warning', message:
           'Password was reset, but the email could not be sent. Check the email history below.' } };
       }
+
+      // handed to SES — a bounce (if any) shows up a few seconds later, so keep checking
+      return { watchDelivery: true };
     }
   });
 
@@ -458,7 +554,18 @@ function UserCard({ user, onRefresh }) {
           </div>
         )}
 
-        <EmailLogs username={user.userName} refresh={emailRefresh} />
+        {delivery && (
+          <div className={`delivery-status ${delivery}`} role="status">
+            {DELIVERY_TEXT[delivery]}
+          </div>
+        )}
+
+        <EmailLogs
+          username={user.userName}
+          refresh={emailRefresh}
+          onLoaded={setLatestLogs}
+          onManualRefresh={refreshAll}
+        />
       </div>
     </>
   );
@@ -594,18 +701,24 @@ export default function HelpdeskPage() {
   const [loadingUser,  setLoadingUser]  = useState(false);
   const [error,        setError]        = useState('');
 
+  const latestRequest = useRef('');   // newest requested username — older responses are ignored
+
   // silent = refresh the selected user in place. Without it the card unmounts
   // during the reload and its action message disappears as soon as it appears.
   const loadUser = async (username, { silent = false } = {}) => {
-    if (!silent) setLoadingUser(true);
-    setError('');
+    latestRequest.current = username;
+    if (!silent) { setLoadingUser(true); setError(''); }
     try {
       const result = await apiSearchUser(username);
+      if (latestRequest.current !== username) return;   // switched to another user meanwhile
       setSelectedUser(result);
     } catch (e) {
-      setError(e.message);
+      if (latestRequest.current !== username) return;
+      // a failed background re-check keeps what is on screen; a failed load shows the error
+      if (silent) console.warn('Background refresh failed:', e.message);
+      else        setError(e.message);
     } finally {
-      if (!silent) setLoadingUser(false);
+      if (!silent && latestRequest.current === username) setLoadingUser(false);
     }
   };
 
