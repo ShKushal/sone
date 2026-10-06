@@ -1,176 +1,168 @@
-import os
-import json
-import time
 import base64
+import hashlib
+import hmac
+import json
+import os
+import time
 import urllib.request
-import struct
 
 VALID_API_KEY = os.environ.get('API_KEY',      '')
 USER_POOL_ID  = os.environ.get('USER_POOL_ID', 'ap-southeast-1_vi0pVitMh')
 REGION        = os.environ.get('REGION',       'ap-southeast-1')
 
-JWKS_URL = f'https://cognito-idp.{REGION}.amazonaws.com/{USER_POOL_ID}/.well-known/jwks.json'
+# App client IDs allowed to call this API with a USER token (comma-separated), e.g. the admin
+# portal's client only — so a token from another app client of the same user pool (such as the
+# broker portal) is refused. Empty = any app client of this pool (the previous behaviour).
+ALLOWED_CLIENT_IDS = {
+    c.strip() for c in os.environ.get('ALLOWED_CLIENT_IDS', '').split(',') if c.strip()
+}
 
-# cache JWKS in Lambda memory — persists across warm invocations
-_jwks_cache = None
+ISSUER   = f'https://cognito-idp.{REGION}.amazonaws.com/{USER_POOL_ID}'
+JWKS_URL = f'{ISSUER}/.well-known/jwks.json'
 
-def get_jwks():
-    global _jwks_cache
-    if _jwks_cache:
-        return _jwks_cache
+# PKCS#1 v1.5 DigestInfo prefix for SHA-256 (RFC 8017, section 9.2)
+SHA256_DIGEST_INFO = bytes.fromhex('3031300d060960864801650304020105000420')
+
+JWKS_REFETCH_MIN_SECONDS = 60   # an unknown key id may be a rotation — but never refetch on every request
+
+# kept across warm invocations
+_jwks_cache      = None
+_jwks_fetched_at = 0.0
+
+
+def b64url_decode(segment):
+    return base64.urlsafe_b64decode(segment + '=' * (-len(segment) % 4))
+
+
+def fetch_jwks():
+    global _jwks_cache, _jwks_fetched_at
+    _jwks_fetched_at = time.time()
     try:
-        print(f'[JWKS] Fetching from {JWKS_URL}')
-        with urllib.request.urlopen(JWKS_URL, timeout=5) as r:
-            _jwks_cache = json.loads(r.read().decode())
-            print(f'[JWKS] Loaded {len(_jwks_cache.get("keys", []))} keys')
-            return _jwks_cache
+        with urllib.request.urlopen(JWKS_URL, timeout=5) as response:
+            _jwks_cache = json.loads(response.read().decode())
+        print(f"[JWKS] Loaded {len(_jwks_cache.get('keys', []))} keys")
     except Exception as e:
         print(f'[JWKS] Fetch failed: {e}')
-        return None
+    return _jwks_cache
 
 
-def base64url_decode(s):
-    s += '=' * (4 - len(s) % 4)
-    return base64.urlsafe_b64decode(s)
+def find_key(kid):
+    """Public key for this key id. An unknown id triggers (at most one per minute) refetch,
+    because Cognito rotates its keys. If the key set cannot be had, there is no key —
+    and no key means the token is refused (fail closed)."""
+    jwks = _jwks_cache or fetch_jwks()
+    for attempt in (1, 2):
+        for key in (jwks or {}).get('keys', []):
+            if key.get('kid') == kid:
+                return key
+        if attempt == 1:
+            if time.time() - _jwks_fetched_at < JWKS_REFETCH_MIN_SECONDS:
+                break
+            jwks = fetch_jwks()
+    return None
 
 
-def verify_signature(token, jwks):
-    """
-    Verify JWT signature using Cognito public keys (RS256).
-    Uses Python's built-in libraries only — no extra dependencies.
-    """
-    try:
-        parts = token.split('.')
-        if len(parts) != 3:
-            return False, 'Invalid token structure'
+def verify_rs256(signing_input, signature, n, e):
+    """RSASSA-PKCS1-v1_5 with SHA-256 (RFC 8017, section 8.2.2), standard library only.
+    The WHOLE encoded block is compared — leading 00 01, the FF padding, the DigestInfo and
+    the hash — not just the trailing hash."""
+    k = (n.bit_length() + 7) // 8
+    if len(signature) != k:
+        return False
+    s = int.from_bytes(signature, 'big')
+    if s >= n:
+        return False
+    encoded = pow(s, e, n).to_bytes(k, 'big')
 
-        header  = json.loads(base64url_decode(parts[0]))
-        kid     = header.get('kid')
-        alg     = header.get('alg', '')
-
-        if alg != 'RS256':
-            return False, f'Unsupported algorithm: {alg}'
-
-        # find matching key by kid
-        keys = jwks.get('keys', [])
-        key  = next((k for k in keys if k.get('kid') == kid), None)
-
-        if not key:
-            return False, f'Key not found: {kid}'
-
-        # decode RSA public key components
-        n_bytes = base64url_decode(key['n'])
-        e_bytes = base64url_decode(key['e'])
-
-        n = int.from_bytes(n_bytes, 'big')
-        e = int.from_bytes(e_bytes, 'big')
-
-        # verify signature using RSA
-        import hashlib
-
-        message   = f'{parts[0]}.{parts[1]}'.encode('utf-8')
-        signature = base64url_decode(parts[2])
-
-        # RSA verify: signature^e mod n should equal hash of message
-        sig_int     = int.from_bytes(signature, 'big')
-        decrypted   = pow(sig_int, e, n)
-        decrypted_b = decrypted.to_bytes((decrypted.bit_length() + 7) // 8, 'big')
-
-        # PKCS1 v1.5 padding check
-        # decrypted should end with SHA256 hash of message
-        msg_hash = hashlib.sha256(message).digest()
-
-        if decrypted_b[-32:] != msg_hash:
-            return False, 'Signature verification failed'
-
-        return True, 'OK'
-
-    except Exception as e:
-        return False, f'Signature error: {str(e)}'
+    digest_info = SHA256_DIGEST_INFO + hashlib.sha256(signing_input).digest()
+    pad_len     = k - len(digest_info) - 3
+    if pad_len < 8:
+        return False
+    expected = b'\x00\x01' + b'\xff' * pad_len + b'\x00' + digest_info
+    return hmac.compare_digest(encoded, expected)
 
 
 def validate_jwt(token):
+    parts = token.split('.')
+    if len(parts) != 3:
+        return { 'valid': False, 'error': 'Invalid token structure' }
+
     try:
-        parts = token.split('.')
-        if len(parts) != 3:
-            return { 'valid': False, 'error': 'Invalid token structure' }
+        header    = json.loads(b64url_decode(parts[0]))
+        payload   = json.loads(b64url_decode(parts[1]))
+        signature = b64url_decode(parts[2])
+    except Exception:
+        return { 'valid': False, 'error': 'Token is not valid base64url / JSON' }
 
-        payload_b64 = parts[1]
-        payload_b64 += '=' * (4 - len(payload_b64) % 4)
-        payload = json.loads(base64.b64decode(payload_b64).decode('utf-8'))
+    if not isinstance(header, dict) or not isinstance(payload, dict):
+        return { 'valid': False, 'error': 'Invalid token structure' }
 
-        print(f"[JWT] iss={payload.get('iss')} exp={payload.get('exp')} token_use={payload.get('token_use')}")
+    # 1. only RS256 — never "none", never a symmetric algorithm
+    if header.get('alg') != 'RS256':
+        return { 'valid': False, 'error': f"Unsupported algorithm: {header.get('alg')}" }
 
-        # 1. check expiry
-        if payload.get('exp', 0) < time.time():
-            return { 'valid': False, 'error': 'Token expired' }
+    # 2. signature, against Cognito's public key (fail closed if the key cannot be had)
+    key = find_key(header.get('kid'))
+    if not key:
+        return { 'valid': False, 'error': 'Signing key not found or key set unavailable' }
+    try:
+        n = int.from_bytes(b64url_decode(key['n']), 'big')
+        e = int.from_bytes(b64url_decode(key['e']), 'big')
+    except Exception:
+        return { 'valid': False, 'error': 'Unusable signing key' }
+    if not verify_rs256(f'{parts[0]}.{parts[1]}'.encode('utf-8'), signature, n, e):
+        return { 'valid': False, 'error': 'Signature invalid' }
 
-        # 2. check issuer
-        expected_issuer = f'https://cognito-idp.{REGION}.amazonaws.com/{USER_POOL_ID}'
-        if payload.get('iss') != expected_issuer:
-            return { 'valid': False, 'error': f"Invalid issuer" }
+    # 3. claims — only trusted now that the signature checks out
+    exp = payload.get('exp')
+    if not isinstance(exp, (int, float)) or exp < time.time():
+        return { 'valid': False, 'error': 'Token expired' }
 
-        # 3. check token use
-        if payload.get('token_use') not in ['id', 'access']:
-            return { 'valid': False, 'error': f"Invalid token_use" }
+    if payload.get('iss') != ISSUER:
+        return { 'valid': False, 'error': 'Invalid issuer' }
 
-        # 4. verify signature against Cognito public keys
-        jwks = get_jwks()
-        if jwks:
-            valid, msg = verify_signature(token, jwks)
-            if not valid:
-                return { 'valid': False, 'error': f'Signature invalid: {msg}' }
-            print(f'[JWT] Signature verified ✅')
-        else:
-            print('[JWT] WARNING: JWKS unavailable — skipping signature check')
+    token_use = payload.get('token_use')
+    if token_use not in ('id', 'access'):
+        return { 'valid': False, 'error': 'Invalid token_use' }
 
-        principal = (
-            payload.get('email') or
-            payload.get('username') or
-            payload.get('sub') or
-            'jwt-user'
-        )
+    if ALLOWED_CLIENT_IDS:
+        client = payload.get('aud') if token_use == 'id' else payload.get('client_id')
+        if client not in ALLOWED_CLIENT_IDS:
+            return { 'valid': False, 'error': 'Token was issued to a different app client' }
 
-        return { 'valid': True, 'principal': principal }
-
-    except Exception as e:
-        return { 'valid': False, 'error': str(e) }
+    principal = (
+        payload.get('email') or
+        payload.get('username') or
+        payload.get('sub') or
+        'jwt-user'
+    )
+    return { 'valid': True, 'principal': principal }
 
 
 def lambda_handler(event, context):
-    print('Authorizer event:', json.dumps(event))
+    # Never log the whole event: it carries the Authorization token and the x-api-key value.
+    print(f"[AUTH] {event.get('routeKey') or event.get('requestContext', {}).get('http', {}).get('path', '?')}")
 
-    headers = event.get('headers', {})
-
-    api_key = (
-        headers.get('x-api-key') or
-        headers.get('X-Api-Key') or
-        headers.get('X-API-Key') or ''
-    )
-
-    auth_header = (
-        headers.get('authorization') or
-        headers.get('Authorization') or ''
-    )
+    headers     = { str(k).lower(): v for k, v in (event.get('headers') or {}).items() }
+    api_key     = headers.get('x-api-key', '')
+    auth_header = headers.get('authorization', '')
 
     # React app — x-api-key: jwt + Bearer token
     if api_key == 'jwt' and auth_header.startswith('Bearer '):
-        token  = auth_header[7:]
-        result = validate_jwt(token)
+        result = validate_jwt(auth_header[7:])
         if result['valid']:
             print(f"[AUTH] JWT valid for: {result['principal']}")
             return allow(result['principal'], 'jwt')
-        else:
-            print(f"[AUTH] JWT invalid: {result['error']}")
-            raise Exception('Unauthorized')
+        print(f"[AUTH] JWT invalid: {result['error']}")
+        return deny()
 
-    # Postman/backend — real API key
-    if api_key and api_key == VALID_API_KEY:
+    # Postman / backend — the real API key
+    if api_key and VALID_API_KEY and hmac.compare_digest(api_key.encode('utf-8'), VALID_API_KEY.encode('utf-8')):
         print('[AUTH] API key valid')
         return allow('api-key-client', 'api-key')
 
     print('[AUTH] No valid credentials')
-    raise Exception('Unauthorized')
+    return deny()
 
 
 def allow(principal, auth_type):
@@ -182,3 +174,9 @@ def allow(principal, auth_type):
             'authType':  auth_type
         }
     }
+
+
+def deny():
+    # A clean 403. Raising instead is reported as a server error (500) by HTTP APIs
+    # and shows up as a failure in the authorizer's error metrics.
+    return { 'isAuthorized': False }

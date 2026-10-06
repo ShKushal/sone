@@ -1,3 +1,4 @@
+import base64
 import boto3
 import html
 import json
@@ -7,7 +8,10 @@ import time
 import string
 import secrets
 from datetime import datetime
+from decimal import Decimal
 from urllib.parse import unquote
+
+from boto3.dynamodb.conditions import Attr, Key
 
 from email_template import PASSWORD_RESET_EMAIL_SUBJECT, PASSWORD_RESET_EMAIL_TEMPLATE
 
@@ -34,6 +38,7 @@ ERROR_STATUS = {
     'USER_EXISTS':    409,
     'USER_NOT_FOUND': 404,
     'BAD_REQUEST':    400,
+    'FORBIDDEN':      403,
 }
 
 # User payload fields — a caller must send each of these as a string
@@ -43,6 +48,12 @@ USER_STRING_FIELDS = (
 )
 
 MAX_PAGE_SIZE = 60   # Cognito ListUsers maximum
+
+# Email delivery activity (GET /email-logs)
+EMAIL_LOG_VIEW_GROUPS   = {'EMAIL_LOGS', 'SUPER_ADMIN'}   # Cognito groups allowed to read it
+EMAIL_LOG_DEFAULT_LIMIT = 500      # newest N events returned when the caller sends no limit
+EMAIL_LOG_MAX_ITEMS     = 1000     # hard ceiling on events returned per request
+EMAIL_LOG_MAX_SCAN      = 20000    # stop reading the table after this many items (reported as incomplete)
 
 # -------------------------------------------------------
 # Request validation helpers
@@ -673,16 +684,170 @@ def get_email_logs(username):
         return []
 
 # -------------------------------------------------------
+# Who is calling? Cognito groups from the ID token.
+# The authorizer has already verified that token, so it is only decoded here.
+# Returns None when there is no user token (API-key callers such as Postman or
+# backend services), which keep the trust they always had.
+# -------------------------------------------------------
+def caller_groups(event):
+    headers = event.get('headers') or {}
+    auth    = headers.get('authorization') or headers.get('Authorization') or ''
+    if not auth.lower().startswith('bearer '):
+        return None
+    try:
+        payload_b64 = auth.split(' ', 1)[1].split('.')[1]
+        payload     = json.loads(base64.urlsafe_b64decode(payload_b64 + '=' * (-len(payload_b64) % 4)))
+        groups      = payload.get('cognito:groups') or []
+    except Exception:
+        return []                                  # unreadable token → no groups → denied
+    return [groups] if isinstance(groups, str) else list(groups)
+
+def can_view_email_logs(event):
+    groups = caller_groups(event)
+    return groups is None or bool(EMAIL_LOG_VIEW_GROUPS & set(groups))
+
+# -------------------------------------------------------
+# Email delivery activity across all recipients
+# -------------------------------------------------------
+EMAIL_LOG_DATE = re.compile(r'^\d{4}-\d{2}-\d{2}(T[0-9:.+\-Z]+)?$')
+
+def _iso_bound(value, end_of_day, name):
+    value = (value or '').strip()
+    if not value:
+        return None
+    if not EMAIL_LOG_DATE.match(value):
+        raise BadRequest(f'{name} must be YYYY-MM-DD or an ISO timestamp')
+    if 'T' not in value:
+        return value + ('T23:59:59.999Z' if end_of_day else 'T00:00:00.000Z')
+    return value
+
+def _plain(value):
+    # DynamoDB returns numbers as Decimal — keep them numbers in the JSON
+    if isinstance(value, Decimal):
+        return int(value) if value == value.to_integral_value() else float(value)
+    if isinstance(value, dict):
+        return {k: _plain(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_plain(v) for v in value]
+    return value
+
+def _email_log_item(raw):
+    item    = {k: _plain(v) for k, v in raw.items() if k != 'ttl'}
+    details = item.get('details')
+    if isinstance(details, str):                   # the logger stores the SES event as a JSON string
+        try:
+            parsed = json.loads(details)
+        except ValueError:
+            parsed = None
+        if isinstance(parsed, dict):
+            item['details'] = parsed               # otherwise leave the raw string as it was
+    return item
+
+def _event_time(item):
+    details = item.get('details')
+    when    = details.get('timestamp') if isinstance(details, dict) else None
+    return str(when or item.get('timestamp') or '')
+
+def _scan_deadline(context):
+    budget = 8.0
+    if context is not None and hasattr(context, 'get_remaining_time_in_millis'):
+        budget = max(1.0, context.get_remaining_time_in_millis() / 1000 - 1.5)
+    return time.time() + budget
+
+def _read_email_logs(email, search, ts_from, ts_to, deadline):
+    # One recipient → an indexed Query. Otherwise a filtered Scan (fine for modest volumes —
+    # see the note in the delivery notes about a GSI before this grows large).
+    kwargs = {}
+    if email:
+        cond = Key('email').eq(email)
+        if ts_from and ts_to: cond = cond & Key('timestamp').between(ts_from, ts_to)
+        elif ts_from:         cond = cond & Key('timestamp').gte(ts_from)
+        elif ts_to:           cond = cond & Key('timestamp').lte(ts_to)
+        kwargs['KeyConditionExpression'] = cond
+        kwargs['ScanIndexForward']       = False
+        read = email_logs_table.query
+    else:
+        flt = None
+        for cond in (
+            Attr('timestamp').gte(ts_from) if ts_from else None,
+            Attr('timestamp').lte(ts_to)   if ts_to   else None,
+            Attr('email').contains(search) if search  else None,
+        ):
+            if cond is not None:
+                flt = cond if flt is None else flt & cond
+        if flt is not None:
+            kwargs['FilterExpression'] = flt
+        read = email_logs_table.scan
+
+    items, scanned, incomplete = [], 0, False
+    while True:
+        response = read(**kwargs)
+        page     = response.get('Items', [])
+        items.extend(page)
+        scanned += response.get('ScannedCount', len(page))
+        last = response.get('LastEvaluatedKey')
+        if not last:
+            break
+        if scanned >= EMAIL_LOG_MAX_SCAN or time.time() > deadline:
+            incomplete = True
+            break
+        kwargs['ExclusiveStartKey'] = last
+    return items, incomplete
+
+def search_email_logs(params, context=None):
+    statuses = [s.strip() for s in (params.get('status') or '').split(',') if s.strip()]
+    for s in statuses:
+        if not re.fullmatch(r'[A-Za-z]{2,30}', s):
+            raise BadRequest('status must be a comma-separated list of event types, e.g. Bounce,Delivery')
+
+    email   = (params.get('email')  or '').strip().lower()
+    search  = (params.get('search') or '').strip().lower()
+    ts_from = _iso_bound(params.get('from'), False, 'from')
+    ts_to   = _iso_bound(params.get('to'),   True,  'to')
+
+    try:
+        limit = int(params.get('limit') or EMAIL_LOG_DEFAULT_LIMIT)
+    except ValueError:
+        raise BadRequest('limit must be a whole number')
+    if limit < 1:
+        raise BadRequest('limit must be at least 1')
+    limit = min(limit, EMAIL_LOG_MAX_ITEMS)
+
+    raw, incomplete = _read_email_logs(email, search, ts_from, ts_to, _scan_deadline(context))
+    items = [_email_log_item(r) for r in raw]
+
+    # the mix of statuses for this window — ignores the status filter, so the counts stay visible while filtering
+    summary = {}
+    for item in items:
+        key = item.get('eventType') or 'Unknown'
+        summary[key] = summary.get(key, 0) + 1
+
+    if statuses:
+        wanted = {s.lower() for s in statuses}
+        items  = [i for i in items if str(i.get('eventType') or '').lower() in wanted]
+
+    items.sort(key=_event_time, reverse=True)
+    total = len(items)
+    return {
+        'items':      items[:limit],
+        'count':      min(total, limit),
+        'total':      total,
+        'summary':    summary,
+        'truncated':  total > limit,     # more matched than were returned — narrow the filters
+        'incomplete': incomplete,        # the table was too large to read in full
+    }
+
+# -------------------------------------------------------
 # Lambda handler
 # -------------------------------------------------------
 def lambda_handler(event, context):
     print('Event:', json.dumps(event))
     try:
-        return route(event)
+        return route(event, context)
     except BadRequest as e:
         return resp(400, { 'success': False, 'errorCode': 'BAD_REQUEST', 'errors': [str(e)] })
 
-def route(event):
+def route(event, context=None):
     route_key        = event.get('routeKey', 'GET /users')
     method           = route_key.split(' ')[0]
     path             = route_key.split(' ')[1]
@@ -769,6 +934,13 @@ def route(event):
             return resp(400, { 'error': 'username is required' })
         logs = get_email_logs(username)
         return resp(200, { 'email': username, 'logs': logs })
+
+    # GET /email-logs — delivery activity across all recipients (EMAIL_LOGS or SUPER_ADMIN)
+    elif method == 'GET' and path == '/email-logs':
+        if not can_view_email_logs(event):
+            return resp(403, { 'success': False, 'errorCode': 'FORBIDDEN',
+                               'errors': ['You do not have access to the email logs'] })
+        return resp(200, search_email_logs(query_parameters, context))
 
     return resp(400, { 'error': 'Invalid request' })
 
