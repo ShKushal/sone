@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
-import { getApiHeaders }               from '../../hooks/useAuth';
+import { getApiHeaders, getCurrentUser } from '../../hooks/useAuth';
+import GROUPS, { isSuperAdmin, SUPER_ADMIN } from '../../config/groups';
 import { fetchAuthSession }            from 'aws-amplify/auth';
 
 const API_URL  = process.env.REACT_APP_API_URL;
@@ -20,6 +21,20 @@ const DELIVERY_SETTLE_MS = 8000;    // after a failure, a few more checks so the
 const CLOCK_SKEW_MS      = 5000;    // browser clock vs SES timestamps
 const REFRESH_MIN_MS     = 600;     // a manual refresh shows its loader at least this long, even when instant
 const DELIVERY_TERMINAL  = ['Delivery', 'Bounce', 'Complaint', 'Reject', 'RenderingFailure'];
+
+const EMPTY = '--';    // shown wherever a value is not set
+
+// "AUDITOR" -> "Auditor", "SUPER_ADMIN" -> "Super Admin" — a portal group the page has never heard of still reads well
+const prettify = name => name.toLowerCase().split('_').map(w => w.charAt(0).toUpperCase() + w.slice(1)).join(' ');
+
+// users-api (TEMP_PHONE) stores this placeholder for people without a phone number: the pool's
+// "SMS recovery fails, so email is used" workaround needs a phone attribute to be present.
+// Keep it in step with TEMP_PHONE until it moves to global config.
+const PLACEHOLDER_PHONE = '+6500000000';
+const PHONE_RE          = /^\+[1-9]\d{6,14}$/;           // international format, what Cognito accepts
+
+// "+65 9123-4567" -> "+6591234567"
+const normalizePhone = raw => String(raw || '').replace(/[\s().-]/g, '');
 
 const DELIVERY_TEXT = {
   waiting:   '⏳ Email sent — checking delivery status…',
@@ -84,18 +99,53 @@ async function apiResetPassword(username, triggeredBy) {
   return data;
 }
 
-async function apiToggleUser(username, enable) {
+async function apiToggleUser(username, enable, triggeredBy) {
   const headers  = await getApiHeaders();
   const response = await fetch(
     `${API_URL}/users/${encodeURIComponent(username)}`,
     {
       method:  'PUT',
       headers,
-      body:    JSON.stringify({ frUnindexedString1: enable ? 'TRUE' : 'FALSE' })
+      body:    JSON.stringify({ frUnindexedString1: enable ? 'TRUE' : 'FALSE', triggeredBy })
     }
   );
   const data = await response.json();
   if (!response.ok) throw new Error(errorMessage(data, 'Update failed'));
+  return data;
+}
+
+// Changes only the fields it is given (givenName, sn, phoneNumber)
+async function apiUpdateUser(username, fields, triggeredBy) {
+  const headers  = await getApiHeaders();
+  const response = await fetch(`${API_URL}/users/${encodeURIComponent(username)}`, {
+    method: 'PUT',
+    headers,
+    body: JSON.stringify({ ...fields, triggeredBy })
+  });
+  const data = await response.json();
+  if (!response.ok) throw new Error(errorMessage(data, 'Update failed'));
+  return data;
+}
+
+// The user's Cognito groups, and which of them can be managed here
+async function apiGetUserGroups(username) {
+  const headers  = await getApiHeaders();
+  const response = await fetch(`${API_URL}/users/${encodeURIComponent(username)}/groups`, { headers });
+  const data = await response.json();
+  if (!response.ok) throw new Error(errorMessage(data, 'Could not load groups'));
+  return data;
+}
+
+// change = { add: [...], remove: [...] } — portal groups only; the server enforces who may do this
+async function apiUpdateUserGroups(username, change, triggeredBy) {
+  const headers  = await getApiHeaders();
+  const response = await fetch(`${API_URL}/users/${encodeURIComponent(username)}/groups`, {
+    method: 'PUT',
+    headers,
+    body: JSON.stringify({ ...change, triggeredBy })
+  });
+  const data = await response.json();
+  if (!response.ok) throw new Error(errorMessage(data, 'Group update failed'));
   return data;
 }
 
@@ -155,6 +205,7 @@ function EmailLogs({ username, refresh, onLoaded, onManualRefresh }) {
   const [loading, setLoading] = useState(true);
   const [refreshing,     setRefreshing]     = useState(false);   // a manual refresh is running
   const [refreshFailed,  setRefreshFailed]  = useState(false);
+  const [open,           setOpen]           = useState(false);   // collapsed until asked for
   const [updatedAt,      setUpdatedAt]      = useState(null);    // when the history was last read
   const firstLoad = useRef(true);   // only the first load shows "Loading..." — re-checks update quietly
   const latest    = useRef(0);      // a slow response must not overwrite a newer one
@@ -216,7 +267,21 @@ function EmailLogs({ username, refresh, onLoaded, onManualRefresh }) {
   return (
     <div className="reset-history">
       <div className="logs-heading">
-        <h3>Email History</h3>
+        <button
+          type="button"
+          className="logs-toggle"
+          onClick={() => setOpen(o => !o)}
+          aria-expanded={open}
+        >
+          <span className="logs-chevron" aria-hidden="true">{open ? '▾' : '▸'}</span>
+          <span className="logs-title">Email History</span>
+          {!loading && <span className="logs-count">{logs.length}</span>}
+          {!open && !loading && logs.length > 0 && (
+            <span className="logs-latest">
+              Latest: {eventIcon(logs[0].eventType)} {logs[0].eventType} · {new Date(logs[0].timestamp).toLocaleString()}
+            </span>
+          )}
+        </button>
         {onManualRefresh && (
           <div className="logs-refresh">
             {!refreshing && refreshFailed && (
@@ -238,17 +303,17 @@ function EmailLogs({ username, refresh, onLoaded, onManualRefresh }) {
           </div>
         )}
       </div>
-      {loading && (
+      {open && loading && (
         <p style={{ fontSize: 12, color: 'var(--grey-400)', padding: '8px 0' }}>
           Loading...
         </p>
       )}
-      {!loading && logs.length === 0 && (
+      {open && !loading && logs.length === 0 && (
         <p style={{ fontSize: 12, color: 'var(--grey-400)', padding: '8px 0' }}>
           No email logs found
         </p>
       )}
-      {!loading && logs.length > 0 && (
+      {open && !loading && logs.length > 0 && (
         <div className={`reset-logs${refreshing ? ' refreshing' : ''}`}>
           {logs.map((log, i) => (
             <div key={i} className="reset-log">
@@ -265,6 +330,49 @@ function EmailLogs({ username, refresh, onLoaded, onManualRefresh }) {
           ))}
         </div>
       )}
+    </div>
+  );
+}
+
+// -------------------------------------------------------
+// A labelled row of group chips
+//   access        = portal groups, on the explicit MANAGEABLE_GROUPS list (the only ones managed here)
+//   organisation  = the group named by the user's own custom:organisation value
+//   other         = anything else — read-only, and worth a look (e.g. a firm group left over after a change)
+// Cognito has no "type" on a group, so nothing is guessed from a name.
+// -------------------------------------------------------
+const GROUP_TITLES = {
+  portal: 'Access group — managed here by a SUPER_ADMIN',
+  org:    "Organisation group — follows the user's organisation",
+  other:  "Not an access group, and not this user's organisation group",
+};
+
+function GroupRow({ label, names, kind, format, hints = {} }) {
+  return (
+    <div className="group-row">
+      <span className="group-row-label">{label}</span>
+      <div className="group-chips">
+        {names.length === 0 && <span className="detail-value">{EMPTY}</span>}
+        {names.map(g => (
+          <span key={g} className={`group-chip ${kind}`} title={hints[g] ? `${GROUP_TITLES[kind]}: ${hints[g]}` : GROUP_TITLES[kind]}>
+            {format ? format(g) : g}
+          </span>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+// -------------------------------------------------------
+// One labelled value (a real <label> when it belongs to an input)
+// -------------------------------------------------------
+function Row({ label, htmlFor, className, children }) {
+  return (
+    <div className={`detail-row${className ? ' ' + className : ''}`}>
+      {htmlFor
+        ? <label className="detail-label" htmlFor={htmlFor}>{label}</label>
+        : <span className="detail-label">{label}</span>}
+      {children}
     </div>
   );
 }
@@ -342,6 +450,72 @@ function UserCard({ user, onRefresh }) {
   const isEnabled = user.enabled;
 
   const { blocked, failCount } = emailStatus(attrs);
+
+  // ---- who is looking, and are they looking at themselves? --------------------------------------------
+  const [me, setMe] = useState(null);                 // null until known
+  useEffect(() => {
+    let alive = true;
+    getCurrentUser().then(who => { if (alive) setMe(who); });
+    return () => { alive = false; };
+  }, []);
+
+  const same   = (a, b) => !!a && !!b && String(a).toLowerCase() === String(b).toLowerCase();
+  const isSelf = !!me && (
+    same(me.username, user.userName) || same(me.email, user.userName) ||
+    (!!me.sub && me.sub === attrs.sub) || same(me.email, attrs.email)
+  );
+  const canAct        = me !== null && !isSelf;       // nobody changes their own account; the server enforces it too
+  const iAmSuperAdmin = !!me && isSuperAdmin(me.groups);
+
+  // ---- groups ------------------------------------------------------------------------------------------
+  const [groupsInfo,    setGroupsInfo]    = useState(null);   // { groups, manageable } | { error }
+  const [groupsVersion, setGroupsVersion] = useState(0);
+  const [managing,      setManaging]      = useState(false);
+  const [groupPick,     setGroupPick]     = useState([]);
+
+  useEffect(() => {
+    let alive = true;
+    apiGetUserGroups(user.userName)
+      .then(info => { if (alive) setGroupsInfo(info); })
+      .catch(e   => { if (alive) setGroupsInfo({ error: e.message }); });
+    return () => { alive = false; };
+  }, [user.userName, groupsVersion]);
+
+  const groupLabel    = g => (GROUPS[g] && GROUPS[g].label) || prettify(g);
+  const hints         = groupsInfo?.hints || {};     // each portal group's own description, from Cognito
+  const manageable    = groupsInfo?.manageable || [];
+  const currentPortal = (groupsInfo?.groups || []).filter(g => manageable.includes(g));
+  const orgName       = attrs['custom:organisation'] || '';
+  const orgGroups     = (groupsInfo?.groups || []).filter(g => !manageable.includes(g) &&  orgName && g === orgName);
+  const otherGroups   = (groupsInfo?.groups || []).filter(g => !manageable.includes(g) && g !== orgName);
+  const groupAdd      = groupPick.filter(g => !currentPortal.includes(g));
+  const groupRemove   = currentPortal.filter(g => !groupPick.includes(g));
+  const groupsDirty   = groupAdd.length + groupRemove.length > 0;
+
+  // ---- editing the profile: first name, last name, phone ----------------------------------------
+  const savedProfile = {
+    given:  attrs.given_name  || '',
+    family: attrs.family_name || '',
+    phone:  attrs.phone_number && attrs.phone_number !== PLACEHOLDER_PHONE ? attrs.phone_number : '',
+  };
+  const [editing, setEditing] = useState(false);
+  const [form,    setForm]    = useState(savedProfile);
+
+  const startEdit  = () => { setForm(savedProfile); setEditing(true); setManaging(false); setMessage(''); };
+  const cancelEdit = () => setEditing(false);
+  const setField   = key => event => setForm(f => ({ ...f, [key]: event.target.value }));
+
+  const phoneValue = normalizePhone(form.phone);
+  const phoneError = phoneValue && !PHONE_RE.test(phoneValue)
+    ? 'Use international format with the country code, e.g. +6591234567'
+    : '';
+
+  // only what actually changed is sent; an empty phone becomes the placeholder
+  const changes = {};
+  if (form.given.trim()  !== savedProfile.given)  changes.givenName   = form.given.trim();
+  if (form.family.trim() !== savedProfile.family) changes.sn          = form.family.trim();
+  if (phoneValue         !== savedProfile.phone)  changes.phoneNumber = phoneValue || PLACEHOLDER_PHONE;
+  const dirty = Object.keys(changes).length > 0;
   const unblockAction = blocked ? 'Email unblock' : 'Failure count reset';
 
   const notice = {
@@ -372,8 +546,10 @@ function UserCard({ user, onRefresh }) {
       );
       onRefresh();
       setEmailRefresh(r => r + 1);
+      setGroupsVersion(v => v + 1);
       if (outcome?.watchDelivery) startWatch(startedAt);
     } catch (e) {
+      setGroupsVersion(v => v + 1);
       showMsg(e.message, 'error');
     } finally {
       setLoading('');
@@ -411,7 +587,7 @@ function UserCard({ user, onRefresh }) {
     confirmLabel: 'Disable user',
     danger:       true,
     action:       'Disable',
-    fn:           () => apiToggleUser(user.userName, false)
+    fn:           async () => apiToggleUser(user.userName, false, await getTriggeredBy())
   });
 
   const confirmEnable = () => setConfirm({
@@ -420,8 +596,58 @@ function UserCard({ user, onRefresh }) {
     confirmLabel: 'Enable user',
     danger:       false,
     action:       'Enable',
-    fn:           () => apiToggleUser(user.userName, true)
+    fn:           async () => apiToggleUser(user.userName, true,  await getTriggeredBy())
   });
+
+  const startManage  = () => { setGroupPick(currentPortal); setManaging(true); setEditing(false); setMessage(''); };
+  const cancelManage = () => setManaging(false);
+  const toggleGroup  = g => setGroupPick(p => p.includes(g) ? p.filter(x => x !== g) : [...p, g]);
+
+  const reviewGroups = () => {
+    if (!groupsDirty) return;
+    const lines = [];
+    if (groupAdd.length)    lines.push(`Add: ${groupAdd.map(groupLabel).join(', ')}`);
+    if (groupRemove.length) lines.push(`Remove: ${groupRemove.map(groupLabel).join(', ')}`);
+    if (groupAdd.includes(SUPER_ADMIN)) {
+      lines.push('', "Super Admin can open every section and manage other people's access.");
+    }
+    lines.push('', 'Takes effect the next time they sign in.');
+    setConfirm({
+      title:        'Change groups?',
+      body:         `Update ${user.userName}:\n${lines.join('\n')}`,
+      confirmLabel: 'Save groups',
+      danger:       groupAdd.includes(SUPER_ADMIN),
+      action:       'Group update',
+      fn:           async () => {
+        const by = await getTriggeredBy();
+        await apiUpdateUserGroups(user.userName, { add: groupAdd, remove: groupRemove }, by);
+        setManaging(false);
+      }
+    });
+  };
+
+  const FIELD_LABEL = { givenName: 'First name', sn: 'Last name', phoneNumber: 'Phone number' };
+  const BEFORE      = { givenName: savedProfile.given, sn: savedProfile.family, phoneNumber: savedProfile.phone };
+
+  const reviewChanges = () => {
+    if (!dirty || phoneError) return;
+    const lines = Object.keys(changes).map(key => {
+      const after = changes[key] === PLACEHOLDER_PHONE ? '' : changes[key];
+      return `${FIELD_LABEL[key]}: ${BEFORE[key] || EMPTY} → ${after || EMPTY}`;
+    });
+    setConfirm({
+      title:        'Save changes?',
+      body:         `Update ${user.userName}:\n${lines.join('\n')}`,
+      confirmLabel: 'Save changes',
+      danger:       false,
+      action:       'Profile update',
+      fn:           async () => {
+        const by = await getTriggeredBy();
+        await apiUpdateUser(user.userName, changes, by);
+        setEditing(false);     // only once it has been saved — a rejected change keeps the form open
+      }
+    });
+  };
 
   const confirmUnblock = () => setConfirm({
     title:        blocked ? 'Unblock email?' : 'Reset failure count?',
@@ -482,47 +708,6 @@ function UserCard({ user, onRefresh }) {
           </div>
         </div>
 
-        <div className="user-details">
-          <div className="detail-row">
-            <span className="detail-label">Organisation</span>
-            <span className="detail-value">{attrs['custom:organisation'] || '—'}</span>
-          </div>
-          <div className="detail-row">
-            <span className="detail-label">Last Login</span>
-            <span className="detail-value">
-              {attrs['custom:lastLogin']
-                ? new Date(attrs['custom:lastLogin']).toLocaleString()
-                : 'Never'
-              }
-            </span>
-          </div>
-          <div className="detail-row">
-            <span className="detail-label">Migration</span>
-            <span className="detail-value">
-              {attrs['custom:migrationType'] || 'Pending'}
-            </span>
-          </div>
-          <div className="detail-row">
-            <span className="detail-label">Created</span>
-            <span className="detail-value">
-              {new Date(user.createdAt).toLocaleDateString()}
-            </span>
-          </div>
-          <div className="detail-row">
-            <span className="detail-label">Email delivery</span>
-            <span
-              className="detail-value"
-              style={{ color: blocked ? 'var(--red)' : failCount > 0 ? 'var(--amber)' : undefined }}
-            >
-              {blocked
-                ? `Blocked (${failCount}/${EMAIL_FAIL_LIMIT} failures)`
-                : failCount > 0
-                  ? `${failCount}/${EMAIL_FAIL_LIMIT} failed deliveries`
-                  : 'Active'}
-            </span>
-          </div>
-        </div>
-
         {(blocked || failCount > 0) && (
           <div className={`email-alert ${blocked ? 'blocked' : 'warn'}`}>
             <div>
@@ -546,6 +731,159 @@ function UserCard({ user, onRefresh }) {
           </div>
         )}
 
+        {isSelf && (
+          <div className="self-notice" role="status">
+            This is your own account. You can view it here, but changes to it (profile, groups,
+            password, enabling or disabling) have to be made by another administrator.
+          </div>
+        )}
+
+        <section className="card-section">
+          <div className="card-section-header">
+            <h3>Profile</h3>
+            {!editing && canAct && (
+              <button className="btn-link" onClick={startEdit} disabled={!!loading}>✎ Edit</button>
+            )}
+          </div>
+
+          <form
+            className="profile-form"
+            onSubmit={event => { event.preventDefault(); reviewChanges(); }}
+          >
+            <div className="card-grid profile-grid">
+              <Row label="First name" htmlFor={editing ? 'pf-given' : undefined}>
+                {editing
+                  ? <input id="pf-given" className="profile-input" value={form.given}
+                           onChange={setField('given')} maxLength={100} autoFocus />
+                  : <span className="detail-value">{attrs.given_name || EMPTY}</span>}
+              </Row>
+              <Row label="Last name" htmlFor={editing ? 'pf-family' : undefined}>
+                {editing
+                  ? <input id="pf-family" className="profile-input" value={form.family}
+                           onChange={setField('family')} maxLength={100} />
+                  : <span className="detail-value">{attrs.family_name || EMPTY}</span>}
+              </Row>
+              <Row label="Phone" htmlFor={editing ? 'pf-phone' : undefined}>
+                {editing
+                  ? <input id="pf-phone" className="profile-input" value={form.phone}
+                           onChange={setField('phone')} placeholder="+6591234567" inputMode="tel" />
+                  : <span className="detail-value">{savedProfile.phone || EMPTY}</span>}
+              </Row>
+              <Row label="Email" className="span-2">
+                <span className="detail-value">{attrs.email || user.userName}</span>
+              </Row>
+              <Row label="Organisation">
+                <span className="detail-value">{attrs['custom:organisation'] || EMPTY}</span>
+              </Row>
+            </div>
+
+            {editing && (
+              <>
+                {phoneError && <div className="field-error" role="alert">{phoneError}</div>}
+                <div className="field-hint">
+                  Phone: international format, e.g. +6591234567 — leave it empty to clear it.
+                  Email and organisation can't be changed here.
+                </div>
+                <div className="profile-actions">
+                  <button
+                    type="submit"
+                    className="btn-action btn-reset"
+                    disabled={!dirty || !!phoneError || !!loading}
+                  >
+                    Review changes
+                  </button>
+                  <button type="button" className="btn-cancel" onClick={cancelEdit} disabled={!!loading}>
+                    Cancel
+                  </button>
+                </div>
+              </>
+            )}
+          </form>
+        </section>
+
+        <section className="card-section">
+          <div className="card-section-header"><h3>Account</h3></div>
+          <div className="card-grid">
+            <Row label="Last Login">
+              <span className="detail-value">
+                {attrs['custom:lastLogin']
+                  ? new Date(attrs['custom:lastLogin']).toLocaleString()
+                  : 'Never'
+                }
+              </span>
+            </Row>
+            <Row label="Migration">
+              <span className="detail-value">{attrs['custom:migrationType'] || EMPTY}</span>
+            </Row>
+            <Row label="Created">
+              <span className="detail-value">
+                {new Date(user.createdAt).toLocaleDateString()}
+              </span>
+            </Row>
+            <Row label="Email delivery">
+              <span
+                className="detail-value"
+                style={{ color: blocked ? 'var(--red)' : failCount > 0 ? 'var(--amber)' : undefined }}
+              >
+                {blocked
+                  ? `Blocked (${failCount}/${EMAIL_FAIL_LIMIT} failures)`
+                  : failCount > 0
+                    ? `${failCount}/${EMAIL_FAIL_LIMIT} failed deliveries`
+                    : 'Active'}
+              </span>
+            </Row>
+          </div>
+        </section>
+
+        <section className="card-section">
+          <div className="card-section-header">
+            <h3>Groups</h3>
+            {canAct && iAmSuperAdmin && manageable.length > 0 && !managing && (
+              <button className="btn-link" onClick={startManage} disabled={!!loading}>✎ Manage</button>
+            )}
+          </div>
+
+          {!groupsInfo && <div className="field-hint">Loading…</div>}
+          {groupsInfo?.error && <div className="field-hint">Could not load groups: {groupsInfo.error}</div>}
+
+          {groupsInfo?.groups && !managing && (
+            <div className="group-rows">
+              <GroupRow label="Access"       names={currentPortal} kind="portal" format={groupLabel} hints={hints} />
+              <GroupRow label="Organisation" names={orgGroups}     kind="org" />
+              {otherGroups.length > 0 && <GroupRow label="Other" names={otherGroups} kind="other" />}
+            </div>
+          )}
+
+          {managing && (
+            <form className="groups-form" onSubmit={event => { event.preventDefault(); reviewGroups(); }}>
+              {manageable.map(g => (
+                <label key={g} className="group-check">
+                  <input type="checkbox" checked={groupPick.includes(g)} onChange={() => toggleGroup(g)} />
+                  <span>{groupLabel(g)}</span>
+                  {g === SUPER_ADMIN && <span className="group-warn">full access</span>}
+                  {hints[g] && <span className="group-hint">{hints[g]}</span>}
+                </label>
+              ))}
+              <div className="field-hint">
+                Changes apply the next time the user signs in. Broker-firm groups follow the
+                user's organisation and are not managed here.
+              </div>
+              <div className="profile-actions">
+                <button type="submit" className="btn-action btn-reset" disabled={!groupsDirty || !!loading}>
+                  Review group changes
+                </button>
+                <button type="button" className="btn-cancel" onClick={cancelManage} disabled={!!loading}>
+                  Cancel
+                </button>
+              </div>
+            </form>
+          )}
+        </section>
+
+        {canAct && <div className="card-section-header actions-header"><h3>Actions</h3></div>}
+
+        {canAct && (
+          <>
         <div className="user-actions">
           {blocked && (
             <button
@@ -600,6 +938,8 @@ function UserCard({ user, onRefresh }) {
             Password reset is unavailable while email is blocked — unblock email first.
           </div>
         )}
+          </>
+        )}
 
         {delivery && (
           <div className={`delivery-status ${delivery}`} role="status">
@@ -611,7 +951,7 @@ function UserCard({ user, onRefresh }) {
           username={user.userName}
           refresh={emailRefresh}
           onLoaded={setLatestLogs}
-          onManualRefresh={onRefresh}
+          onManualRefresh={() => { setGroupsVersion(v => v + 1); return onRefresh(); }}
         />
       </div>
     </>

@@ -1500,3 +1500,173 @@ button.stat-card.active { border-color: var(--blue); box-shadow: 0 0 0 2px var(-
   .el-detail-grid { grid-template-columns: 1fr; gap: 2px 0; }
   .el-detail-grid dd { margin-bottom: 8px; }
 }
+
+/* =====================================================
+   Helpdesk — user card sections, profile editing, collapsible history
+   ===================================================== */
+.card-section { margin-bottom: 18px; }
+
+.card-section-header {
+  display:         flex;
+  align-items:     center;
+  justify-content: space-between;
+  margin-bottom:   10px;
+}
+
+.card-section-header h3 {
+  margin:         0;
+  font-size:      11.5px;
+  font-weight:    600;
+  text-transform: uppercase;
+  letter-spacing: .04em;
+  color:          var(--grey-400);
+}
+
+.actions-header { margin-bottom: 8px; }
+
+.card-grid {
+  display:               grid;
+  grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
+  gap:                   16px;
+  margin-bottom:         6px;
+}
+
+.profile-input {
+  width:         100%;
+  padding:       7px 10px;
+  border:        1px solid var(--grey-300);
+  border-radius: var(--radius-sm);
+  font-family:   inherit;
+  font-size:     13.5px;
+  color:         var(--grey-900);
+  background:    var(--white);
+  box-sizing:    border-box;
+}
+
+.profile-input:focus { outline: none; border-color: var(--blue); box-shadow: 0 0 0 2px var(--blue-light); }
+
+.field-hint  { margin-top: 10px; font-size: 12px; color: var(--grey-400); line-height: 1.5; }
+.field-error { margin-top: 10px; font-size: 12.5px; font-weight: 500; color: var(--red); }
+
+.profile-actions { display: flex; gap: 10px; margin-top: 12px; }
+
+/* the confirmation lists one change per line */
+.confirm-body { white-space: pre-line; }
+
+/* Email History: collapsed until asked for */
+.logs-toggle {
+  display:     flex;
+  align-items: center;
+  gap:         8px;
+  padding:     0;
+  background:  none;
+  border:      none;
+  font-family: inherit;
+  text-align:  left;
+  cursor:      pointer;
+  min-width:   0;
+}
+
+.logs-chevron { width: 10px; font-size: 11px; color: var(--grey-400); }
+.logs-title   { font-size: 12.5px; font-weight: 600; color: var(--grey-900); }
+
+.logs-count {
+  font-size:     11px;
+  font-weight:   600;
+  padding:       1px 7px;
+  border-radius: 20px;
+  background:    var(--grey-100);
+  color:         var(--grey-600);
+}
+
+.logs-latest {
+  font-size:     12px;
+  color:         var(--grey-400);
+  overflow:      hidden;
+  text-overflow: ellipsis;
+  white-space:   nowrap;
+}
+
+.logs-toggle:hover .logs-title { color: var(--blue); }
+
+/* Long values (an email address has no spaces to break at) must wrap INSIDE their cell, never run into the next one */
+.card-grid { grid-template-columns: repeat(auto-fit, minmax(min(170px, 100%), 1fr)); }
+.card-grid .detail-row   { min-width: 0; }
+.card-grid .detail-value { overflow-wrap: anywhere; }
+
+/* Profile: three columns — first name, last name, phone — then email (double width) beside organisation */
+.profile-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+.profile-grid .span-2 { grid-column: span 2; }
+
+@media (max-width: 760px) {
+  .profile-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .profile-grid .span-2 { grid-column: 1 / -1; }
+}
+
+/* =====================================================
+   Helpdesk — groups, own-account notice, header badges
+   ===================================================== */
+.group-chips { display: flex; flex-wrap: wrap; gap: 6px; }
+
+.group-chip {
+  font-size:     12px;
+  font-weight:   500;
+  padding:       3px 10px;
+  border-radius: 20px;
+  background:    var(--grey-100);
+  color:         var(--grey-600);
+}
+
+.group-chip.portal { background: var(--blue-light); color: var(--blue); }
+
+.group-check {
+  display:     flex;
+  align-items: center;
+  gap:         8px;
+  padding:     6px 0;
+  font-size:   13.5px;
+  color:       var(--grey-900);
+  cursor:      pointer;
+}
+
+.group-warn {
+  font-size:     11px;
+  font-weight:   600;
+  padding:       1px 8px;
+  border-radius: 20px;
+  background:    var(--red-bg);
+  color:         var(--red);
+}
+
+.self-notice {
+  margin-bottom: 14px;
+  padding:       10px 14px;
+  font-size:     12.5px;
+  line-height:   1.5;
+  color:         var(--blue);
+  background:    var(--blue-light);
+  border-radius: var(--radius-sm);
+}
+
+/* long names and many badges wrap instead of squeezing */
+.user-card-header > div:first-child { min-width: 0; }
+.user-email-text { overflow-wrap: anywhere; }
+.user-badges { flex-wrap: wrap; justify-content: flex-end; }
+.user-badges .badge { white-space: nowrap; }
+
+/* Groups: one labelled row per kind */
+.group-rows { display: flex; flex-direction: column; gap: 8px; }
+.group-row  { display: flex; align-items: baseline; gap: 14px; }
+
+.group-row-label {
+  flex:           0 0 92px;
+  font-size:      10.5px;
+  font-weight:    500;
+  text-transform: uppercase;
+  letter-spacing: .4px;
+  color:          var(--grey-400);
+}
+
+.group-chip.other { background: var(--amber-bg); color: var(--amber); }
+
+.group-hint { font-size: 12px; color: var(--grey-400); }

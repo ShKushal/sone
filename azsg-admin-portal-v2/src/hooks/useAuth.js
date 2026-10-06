@@ -1,6 +1,24 @@
 import { fetchAuthSession } from 'aws-amplify/auth';
 
 /**
+ * Who is signed in — read from the verified session, so the page can recognise "this is me".
+ */
+export async function getCurrentUser() {
+  try {
+    const session = await fetchAuthSession();
+    const p = session.tokens?.idToken?.payload || {};
+    return {
+      username: String(p['cognito:username'] || ''),
+      email:    String(p.email || ''),
+      sub:      String(p.sub || ''),
+      groups:   p['cognito:groups'] || [],
+    };
+  } catch {
+    return { username: '', email: '', sub: '', groups: [] };
+  }
+}
+
+/**
  * Get current user groups from JWT token
  */
 export async function getUserGroups() {

@@ -211,6 +211,8 @@ def create_user(user):
         return bad_request(['userName is required'])
     if not email:
         return bad_request(['mail (email) is required'])
+    if portal_group_clash(organisation):
+        return bad_request([f'organisation cannot be the name of a portal group ({organisation})'])
 
     try:
         cognito.admin_create_user(
@@ -435,6 +437,9 @@ def update_user(username, updates, triggered_by=''):
     problems = validate_string_fields(updates)
     if problems:
         return bad_request(problems, userName=username)
+    if portal_group_clash(updates.get('organisation')):
+        return bad_request([f"organisation cannot be the name of a portal group ({updates['organisation'].strip()})"],
+                           userName=username)
 
     # audit trail in CloudWatch: who changed which fields (names only, not the values)
     print(f"[UPDATE] {username} fields={sorted(updates)} by {triggered_by or 'unknown'}")
@@ -502,6 +507,8 @@ def update_user(username, updates, triggered_by=''):
             ).get('Groups', [])
 
             for group in current_groups:
+                if is_portal_group(group.get('Description')) or group['GroupName'] in POLICY_GROUPS:
+                    continue          # portal roles (HELPDESK, ...) are not tied to the organisation
                 cognito.admin_remove_user_from_group(
                     UserPoolId=USER_POOL_ID,
                     Username=username,
@@ -687,12 +694,186 @@ def get_email_logs(username):
         return []
 
 # -------------------------------------------------------
-# Who is calling? Cognito groups from the ID token.
-# The authorizer has already verified that token, so it is only decoded here.
-# Returns None when there is no user token (API-key callers such as Postman or
-# backend services), which keep the trust they always had.
+# User groups: list, and grant / remove portal groups
 # -------------------------------------------------------
-def caller_groups(event):
+def list_user_groups(username):
+    """Every Cognito group the user is in, or None if there is no such user."""
+    names, token = [], None
+    try:
+        while True:
+            kwargs = { 'UserPoolId': USER_POOL_ID, 'Username': username }
+            if token:
+                kwargs['NextToken'] = token
+            response = cognito.admin_list_groups_for_user(**kwargs)
+            names   += [g['GroupName'] for g in response.get('Groups', [])]
+            token    = response.get('NextToken')
+            if not token:
+                return names
+    except cognito.exceptions.UserNotFoundException:
+        return None
+
+def update_user_groups(username, body, actor):
+    add    = body.get('add',    [])
+    remove = body.get('remove', [])
+
+    problems = [
+        f'{name} must be a list of group names'
+        for name, value in (('add', add), ('remove', remove))
+        if not isinstance(value, list) or not all(isinstance(v, str) for v in value)
+    ]
+    if problems:
+        return bad_request(problems, userName=username)
+
+    add    = list(dict.fromkeys(v.strip() for v in add    if v.strip()))
+    remove = list(dict.fromkeys(v.strip() for v in remove if v.strip()))
+    if not add and not remove:
+        return bad_request(['add or remove must list at least one group'], userName=username)
+
+    try:
+        portal = portal_groups()
+        if any(g not in portal for g in add + remove):
+            portal = portal_groups(force=True)        # perhaps a group created a moment ago
+    except Exception as e:
+        return { 'userName': username, 'success': False, 'errors': [f'Could not check which groups are portal groups: {e}'] }
+    unknown = sorted({g for g in add + remove if g not in portal})
+    if unknown:
+        return bad_request([f"Not a group that can be managed here (its description must start with {PORTAL_GROUP_MARKER}): {', '.join(unknown)}"],
+                           userName=username)
+    both = sorted(set(add) & set(remove))
+    if both:
+        return bad_request([f"Cannot add and remove the same group: {', '.join(both)}"], userName=username)
+
+    current = list_user_groups(username)
+    if current is None:
+        return not_found(username)
+
+    added, removed, errors = [], [], []
+    for group in (g for g in add if g not in current):
+        try:
+            cognito.admin_add_user_to_group(UserPoolId=USER_POOL_ID, Username=username, GroupName=group)
+            added.append(group)
+        except cognito.exceptions.ResourceNotFoundException:
+            errors.append(f'Group {group} does not exist in the user pool')
+        except Exception as e:
+            errors.append(f'Could not add {group}: {e}')
+    for group in (g for g in remove if g in current):
+        try:
+            cognito.admin_remove_user_from_group(UserPoolId=USER_POOL_ID, Username=username, GroupName=group)
+            removed.append(group)
+        except Exception as e:
+            errors.append(f'Could not remove {group}: {e}')
+
+    print(f"[GROUPS] {username} added={added} removed={removed} by {actor}")
+    return {
+        'userName': username,
+        'success':  not errors,
+        'added':    added,
+        'removed':  removed,
+        'groups':   list_user_groups(username) or [],
+        'errors':   errors,
+    }
+
+# -------------------------------------------------------
+# Who is calling, and what may they do?
+#
+# A signed-in portal user is identified by the token the authorizer has already verified (it is
+# only decoded here). Callers that use the API key (Postman, backend jobs) carry no user token:
+# they are trusted, as before, and none of the rules below apply to them.
+# -------------------------------------------------------
+HELPDESK_GROUPS = {'HELPDESK', 'SUPER_ADMIN'}
+ADMIN_GROUPS    = {'SUPER_ADMIN'}
+
+# -------------------------------------------------------
+# Which groups are portal groups? The groups say so themselves.
+#
+# Cognito groups have no "type", and organisation groups (one per broker firm) share the same
+# namespace. A group is a PORTAL group — one this API may grant or remove — when its DESCRIPTION
+# starts with the marker below. Create one like this:
+#     aws cognito-idp create-group ... --description "[portal] Can view email delivery logs"
+# Organisation groups are created by broker-firms-api with the firm's display name as their
+# description, so they are never portal groups. No marker = not manageable (safe by default).
+# -------------------------------------------------------
+PORTAL_GROUP_MARKER        = os.environ.get('PORTAL_GROUP_MARKER', '').strip() or '[portal]'
+PORTAL_GROUP_CACHE_SECONDS = 60
+
+_portal_cache = { 'at': 0.0, 'groups': None }        # name -> hint (the text after the marker)
+
+def is_portal_group(description):
+    return isinstance(description, str) and description.strip().lower().startswith(PORTAL_GROUP_MARKER.lower())
+
+def group_hint(description):
+    return description.strip()[len(PORTAL_GROUP_MARKER):].strip(' -—:')
+
+def portal_groups(force=False):
+    """name -> hint for every portal group in the pool. Looked up in Cognito and kept for a minute,
+    so a newly created group shows up on its own. If Cognito cannot be asked, the last list is used."""
+    cached = _portal_cache['groups']
+    if cached is not None and not force and time.time() - _portal_cache['at'] < PORTAL_GROUP_CACHE_SECONDS:
+        return cached
+    try:
+        found, token = {}, None
+        while True:
+            kwargs = { 'UserPoolId': USER_POOL_ID, 'Limit': 60 }
+            if token:
+                kwargs['NextToken'] = token
+            response = cognito.list_groups(**kwargs)
+            for group in response.get('Groups', []):
+                if is_portal_group(group.get('Description')):
+                    found[group['GroupName']] = group_hint(group['Description'])
+            token = response.get('NextToken')
+            if not token:
+                break
+    except Exception as e:
+        if cached is not None:
+            print(f'[GROUPS] could not refresh the portal groups, using the last list: {e}')
+            return cached
+        raise
+    _portal_cache.update(at=time.time(), groups=found)
+    if not found:
+        print(f'[GROUPS] WARNING: no group has a description starting with {PORTAL_GROUP_MARKER}')
+    return found
+
+# A user's organisation value becomes the NAME of a Cognito group they are put in (create_user and
+# update_user do that). Organisation groups and portal groups share one namespace, so an
+# organisation named like a portal group would hand that group over. Always protected: the groups
+# this API's own rules rely on (POLICY_GROUPS) — even if nobody marked them — plus every marked group.
+def portal_group_clash(organisation):
+    name = organisation.strip().upper() if isinstance(organisation, str) else ''
+    if not name:
+        return False
+    if name in {g.upper() for g in POLICY_GROUPS}:
+        return True
+    try:
+        return name in {g.upper() for g in portal_groups()}
+    except Exception as e:
+        print(f'[GROUPS] could not check the portal groups ({e}); only the groups this API relies on are protected')
+        return False
+
+# What a HELPDESK user may change on someone else's record. Anything else (email, organisation, ...)
+# needs SUPER_ADMIN — changing an email address and then resetting the password is an account takeover.
+HELPDESK_EDITABLE_FIELDS = {'givenName', 'sn', 'phoneNumber', 'frUnindexedString1'}
+
+# (method, path) -> (groups that may call it, may the caller NOT use it on their own account?)
+ROUTE_POLICY = {
+    ('GET',    '/users'):                            (HELPDESK_GROUPS,       False),
+    ('GET',    '/users/{username}'):                 (HELPDESK_GROUPS,       False),
+    ('GET',    '/users/{username}/email-logs'):      (HELPDESK_GROUPS,       False),
+    ('GET',    '/users/{username}/groups'):          (HELPDESK_GROUPS,       False),
+    ('PUT',    '/users/{username}'):                 (HELPDESK_GROUPS,       True),
+    ('POST',   '/users/{username}/reset-password'):  (HELPDESK_GROUPS,       True),
+    ('POST',   '/users/{username}/email-unblock'):   (HELPDESK_GROUPS,       True),
+    ('PUT',    '/users/{username}/groups'):          (ADMIN_GROUPS,          True),
+    ('POST',   '/users'):                            (ADMIN_GROUPS,          False),
+    ('POST',   '/users/bulk'):                       (ADMIN_GROUPS,          False),
+    ('DELETE', '/users/{username}'):                 (ADMIN_GROUPS,          True),
+    ('GET',    '/email-logs'):                       (EMAIL_LOG_VIEW_GROUPS, False),
+}
+
+# every group this API's own rules refer to
+POLICY_GROUPS = set().union(*(allowed for allowed, _ in ROUTE_POLICY.values()))
+
+def caller_identity(event):
+    """Who is calling, from the token in the Authorization header. None = no user token (API key)."""
     headers = event.get('headers') or {}
     auth    = headers.get('authorization') or headers.get('Authorization') or ''
     if not auth.lower().startswith('bearer '):
@@ -702,12 +883,60 @@ def caller_groups(event):
         payload     = json.loads(base64.urlsafe_b64decode(payload_b64 + '=' * (-len(payload_b64) % 4)))
         groups      = payload.get('cognito:groups') or []
     except Exception:
-        return []                                  # unreadable token → no groups → denied
-    return [groups] if isinstance(groups, str) else list(groups)
+        return { 'groups': [], 'username': '', 'email': '', 'sub': '' }     # unreadable → nobody → denied
+    return {
+        'groups':   [groups] if isinstance(groups, str) else list(groups),
+        'username': str(payload.get('cognito:username') or payload.get('username') or ''),
+        'email':    str(payload.get('email') or ''),
+        'sub':      str(payload.get('sub') or ''),
+    }
 
-def can_view_email_logs(event):
-    groups = caller_groups(event)
-    return groups is None or bool(EMAIL_LOG_VIEW_GROUPS & set(groups))
+def actor_of(identity, claimed=''):
+    """Who to record as having done something. A signed-in user is named by their verified token —
+    never by what the request body claims."""
+    if identity is not None:
+        return identity['email'] or identity['username'] or 'unknown'
+    return claimed or 'unknown'
+
+def is_self(identity, username):
+    """True when the signed-in user is the account being changed."""
+    mine   = { identity['username'].lower(), identity['email'].lower() } - { '' }
+    if username.strip().lower() in mine:
+        return True
+    # the Cognito username can differ from the login name / email: compare the account itself
+    user = get_user(username)
+    if not user:
+        return False
+    attrs = user['attributes']
+    if identity['sub'] and attrs.get('sub') == identity['sub']:
+        return True
+    return bool(attrs.get('email')) and attrs['email'].lower() in mine
+
+def forbidden(message, code='FORBIDDEN'):
+    return resp(403, { 'success': False, 'errorCode': code, 'errors': [message] })
+
+def authorize(identity, method, path, username, body):
+    """None to carry on, or a 403 response."""
+    if identity is None:
+        return None
+    policy = ROUTE_POLICY.get((method, path))
+    if policy is None:
+        return None
+    allowed, protect_self = policy
+    groups = set(identity['groups'])
+
+    if not (allowed & groups):
+        return forbidden('You do not have access to this action')
+
+    if protect_self and username and is_self(identity, username):
+        return forbidden('You cannot change your own account. Ask another administrator.', 'SELF_CHANGE_FORBIDDEN')
+
+    if (method, path) == ('PUT', '/users/{username}') and not (ADMIN_GROUPS & groups):
+        blocked = sorted(set(body) - HELPDESK_EDITABLE_FIELDS - { 'triggeredBy' })
+        if blocked:
+            return forbidden(f"Changing {', '.join(blocked)} needs the SUPER_ADMIN group")
+
+    return None
 
 # -------------------------------------------------------
 # Email delivery activity across all recipients
@@ -859,6 +1088,11 @@ def route(event, context=None):
     query_parameters = event.get('queryStringParameters') or {}
     username         = unquote(path_parameters.get('username', ''))
 
+    identity = caller_identity(event)
+    denied   = authorize(identity, method, path, username, body)
+    if denied:
+        return denied
+
     # POST /users/bulk
     if method == 'POST' and path == '/users/bulk':
         users = body.get('users', [])
@@ -902,7 +1136,7 @@ def route(event, context=None):
             return resp(400, { 'error': 'username is required' })
         if not body:
             return resp(400, { 'error': 'No fields to update' })
-        triggered_by = body.pop('triggeredBy', '')
+        triggered_by = actor_of(identity, body.pop('triggeredBy', ''))
         result = update_user(username, body, triggered_by)
         return respond_with(result)
 
@@ -919,7 +1153,7 @@ def route(event, context=None):
     elif method == 'POST' and path == '/users/{username}/reset-password':
         if not username:
             return resp(400, { 'error': 'username is required' })
-        triggered_by = body.get('triggeredBy', '')
+        triggered_by = actor_of(identity, body.get('triggeredBy', ''))
         result = reset_user_password(username, triggered_by)
         return respond_with(result)
 
@@ -927,7 +1161,7 @@ def route(event, context=None):
     elif method == 'POST' and path == '/users/{username}/email-unblock':
         if not username:
             return resp(400, { 'error': 'username is required' })
-        triggered_by = body.get('triggeredBy', '')
+        triggered_by = actor_of(identity, body.get('triggeredBy', ''))
         result = unblock_email(username, triggered_by)
         return respond_with(result)
 
@@ -938,11 +1172,29 @@ def route(event, context=None):
         logs = get_email_logs(username)
         return resp(200, { 'email': username, 'logs': logs })
 
+    # GET /users/{username}/groups
+    elif method == 'GET' and path == '/users/{username}/groups':
+        if not username:
+            return resp(400, { 'error': 'username is required' })
+        groups = list_user_groups(username)
+        if groups is None:
+            return resp(404, not_found(username))
+        try:
+            portal = portal_groups()
+        except Exception as e:
+            return resp(500, { 'success': False, 'errors': [f'Could not look up the portal groups: {e}'] })
+        return resp(200, { 'userName': username, 'groups': groups, 'manageable': sorted(portal), 'hints': portal })
+
+    # PUT /users/{username}/groups — grant / remove portal groups (SUPER_ADMIN, never on yourself)
+    elif method == 'PUT' and path == '/users/{username}/groups':
+        if not username:
+            return resp(400, { 'error': 'username is required' })
+        triggered_by = actor_of(identity, body.get('triggeredBy', ''))
+        result = update_user_groups(username, body, triggered_by)
+        return respond_with(result)
+
     # GET /email-logs — delivery activity across all recipients (EMAIL_LOGS or SUPER_ADMIN)
     elif method == 'GET' and path == '/email-logs':
-        if not can_view_email_logs(event):
-            return resp(403, { 'success': False, 'errorCode': 'FORBIDDEN',
-                               'errors': ['You do not have access to the email logs'] })
         return resp(200, search_email_logs(query_parameters, context))
 
     return resp(400, { 'error': 'Invalid request' })
