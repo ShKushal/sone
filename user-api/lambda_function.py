@@ -436,6 +436,9 @@ def update_user(username, updates, triggered_by=''):
     if problems:
         return bad_request(problems, userName=username)
 
+    # audit trail in CloudWatch: who changed which fields (names only, not the values)
+    print(f"[UPDATE] {username} fields={sorted(updates)} by {triggered_by or 'unknown'}")
+
     if 'frUnindexedString1' in updates:
         is_active = updates['frUnindexedString1'].upper() == 'TRUE'
         try:
