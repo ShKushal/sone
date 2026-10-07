@@ -6,6 +6,9 @@ from email_templates import INVITATION_EMAIL_TEMPLATE
 
 PLACEHOLDER_PATTERN = re.compile(r"\{\{(\w+)\}\}")
 
+MIGRATION_TYPE_ATTRIBUTE = "custom:migrationType"
+BULK_MIGRATION = "bulk"
+
 
 def build_greeting(attrs):
     given_name = (
@@ -49,7 +52,19 @@ def build_activation_link():
     return REDIRECT_URI
 
 
-def render_email(greeting, request):
+def is_bulk_migration(attrs):
+    """
+    Users bulk-migrated from ForgeRock carry custom:migrationType = Bulk
+    and get the migration invitation instead of the standard one.
+    """
+    migration_type = (
+        attrs.get(MIGRATION_TYPE_ATTRIBUTE) or ""
+    ).strip()
+
+    return migration_type.lower() == BULK_MIGRATION
+
+
+def render_email(greeting, request, template=INVITATION_EMAIL_TEMPLATE):
     # Cognito placeholders
     # Cognito replaces these after the Lambda returns.
     values = {
@@ -71,5 +86,5 @@ def render_email(greeting, request):
     # Single pass, so a {{...}} inside a user's name is never expanded
     return PLACEHOLDER_PATTERN.sub(
         lambda match: values[match.group(1)],
-        INVITATION_EMAIL_TEMPLATE
+        template
     )

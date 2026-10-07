@@ -86,6 +86,86 @@ UEN: 201903913C | 79 Robinson Road - #09-01 |
 
 
 # ------------------------------------------------------------
+# Invitation for users bulk-migrated from ForgeRock
+# (CustomMessage_AdminCreateUser, custom:migrationType = Bulk)
+# Must keep {{usernameParameter}} and {{codeParameter}}: Cognito
+# rejects an invitation without {username} and {####}.
+# ------------------------------------------------------------
+
+MIGRATION_INVITATION_EMAIL_SUBJECT = 'AZConnect has a new login - activate your account'
+
+MIGRATION_INVITATION_EMAIL_TEMPLATE = r"""
+<html>
+<body>
+
+<p>{{greeting}}</p>
+
+<p>
+We have upgraded the AZConnect login. As part of this upgrade, your
+existing AZConnect account has been moved to the new login.
+</p>
+
+<p>
+To continue using AZConnect, please activate your account on the new
+login:
+<a href="{{activationLink}}">
+activate my account
+</a>
+</p>
+
+<p>
+Sign in with the login details below. You will then be asked to set
+a new password.
+</p>
+
+<p>
+<em>
+Please ensure that your new password complies with the following
+set of rules:
+</em>
+</p>
+
+<ul>
+    <li><em>10 characters long minimum</em></li>
+    <li><em>One upper case</em></li>
+    <li><em>One lower case</em></li>
+    <li><em>One number (0,1,2,3,4,5,6,7,8,9)</em></li>
+    <li>
+        <em>
+        One special character (!,@,#,$,%,^,&amp;,*)
+        </em>
+    </li>
+</ul>
+
+<p>Your login details:</p>
+
+<p>
+    User ID: {{usernameParameter}}<br>
+    Temporary password: {{codeParameter}}
+</p>
+
+<p>
+If you encounter any issues, please send a message to the
+following mailbox:
+<a href="mailto:azsupport@allianz.sg">
+azsupport@allianz.sg
+</a>
+</p>
+
+<p>Thank you</p>
+
+<p>
+Allianz Insurance Singapore<br>
+UEN: 201903913C | 79 Robinson Road - #09-01 |
+068897, Singapore
+</p>
+
+</body>
+</html>
+"""
+
+
+# ------------------------------------------------------------
 # Sign-in OTP  (CustomMessage_Authentication)
 # ------------------------------------------------------------
 

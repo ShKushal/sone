@@ -24,10 +24,13 @@ from email_templates import (
     FORGOT_PASSWORD_EMAIL_SUBJECT,
     FORGOT_PASSWORD_EMAIL_TEMPLATE,
     INVITATION_EMAIL_SUBJECT,
+    INVITATION_EMAIL_TEMPLATE,
+    MIGRATION_INVITATION_EMAIL_SUBJECT,
+    MIGRATION_INVITATION_EMAIL_TEMPLATE,
     OTP_EMAIL_SUBJECT,
     OTP_EMAIL_TEMPLATE,
 )
-from invitation_email import build_greeting, render_email
+from invitation_email import build_greeting, is_bulk_migration, render_email
 from otp_email import render_otp_email
 from user_attributes import mark_invitation_sent
 
@@ -134,18 +137,27 @@ def _handle_invitation(event):
     request = event.get("request", {})
     attrs = request.get("userAttributes", {})
 
+    # Users bulk-migrated from ForgeRock get the migration invitation
+    if is_bulk_migration(attrs):
+        subject = MIGRATION_INVITATION_EMAIL_SUBJECT
+        template = MIGRATION_INVITATION_EMAIL_TEMPLATE
+    else:
+        subject = INVITATION_EMAIL_SUBJECT
+        template = INVITATION_EMAIL_TEMPLATE
+
     greeting = build_greeting(attrs)
-    message = render_email(greeting, request)
+    message = render_email(greeting, request, template)
 
     # Set Cognito custom response
     event.setdefault("response", {})
 
-    event["response"]["emailSubject"] = INVITATION_EMAIL_SUBJECT
+    event["response"]["emailSubject"] = subject
     event["response"]["emailMessage"] = message
 
     logger.info(
-        "Custom email subject: %s",
-        INVITATION_EMAIL_SUBJECT
+        "Custom email subject: %s (migrationType: %s)",
+        subject,
+        attrs.get("custom:migrationType", "")
     )
 
     logger.info(
