@@ -47,6 +47,10 @@ USER_STRING_FIELDS = (
     'frUnindexedString1', 'frIndexedString2', 'frUnindexedString5',
 )
 
+# How a user came to exist in Cognito: JIT = moved over by logging in, BULK = created by the cutover import.
+# The reports count any non-empty value as "migrated".
+MIGRATION_TYPES = {'JIT', 'BULK'}
+
 MAX_PAGE_SIZE = 60   # Cognito ListUsers maximum
 
 # Email delivery activity (GET /email-logs)
@@ -192,6 +196,13 @@ def create_user(user):
     if problems:
         return bad_request(problems)
 
+    migration_type = user.get('migrationType', '')           # optional
+    if not isinstance(migration_type, str):
+        return bad_request(['migrationType must be a string'])
+    migration_type = migration_type.strip().upper()
+    if migration_type and migration_type not in MIGRATION_TYPES:
+        return bad_request([f"migrationType must be one of: {', '.join(sorted(MIGRATION_TYPES))}"])
+
     username             = user.get('userName',           '').strip()
     email                = user.get('mail',               '').strip()
     given_name           = user.get('givenName',          '').strip()
@@ -230,7 +241,7 @@ def create_user(user):
                 { 'Name': 'custom:frUnindexedString1', 'Value': fr_unindexed_string1 },
                 { 'Name': 'custom:frUnindexedString2', 'Value': fr_unindexed_string2 },
                 { 'Name': 'custom:frUnindexedString5', 'Value': fr_unindexed_string5 },
-            ]
+            ] + ([{ 'Name': 'custom:migrationType', 'Value': migration_type }] if migration_type else [])
         )
         print(f"Cognito user created: {username}")
 

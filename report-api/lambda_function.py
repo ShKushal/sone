@@ -51,6 +51,13 @@ def extract_org_details(fr_user):
         'country':     org.get('country', '')
     }
 
+def clean(value, default=''):
+    """A ForgeRock value as plain text. A missing or null value must never turn into the word "None"."""
+    if value is None:
+        return default
+    text = str(value).strip()
+    return default if text in ('', 'None', 'null') else text
+
 # -------------------------------------------------------
 # Get all Cognito users
 # -------------------------------------------------------
@@ -602,43 +609,79 @@ def handle_forgerock_gap(params, fmt):
         )
         print(f'ForgeRock total users: {len(fr_users)}')
 
-        cognito_users = get_cognito_users()
+        cognito_users  = get_cognito_users()
+        # also match on the email ADDRESS stored in Cognito, not only on the username — otherwise a
+        # user who exists under a different username would be created a second time
+        cognito_emails = { u['email'].lower() for u in cognito_users.values() if u.get('email') }
 
-        missing = []
-        by_org  = {}
+        # firms that exist in BrokerFirms — only used to warn about users who point at a firm that does not exist yet
+        try:
+            known_firms = { f.get('UEN', '') for f in table.scan().get('Items', []) }
+        except Exception as e:
+            print(f'Could not read BrokerFirms ({e}) — unknownFirms not checked')
+            known_firms = None
+
+        missing    = []
+        by_org     = {}
+        org_source = { 'frUnindexedString5': 0, 'forgerockOrganisation': 0, 'unassigned': 0 }
+        conflicts  = []
 
         for fr_user in fr_users:
             username   = (fr_user.get('userName') or '').lower()
             email      = (fr_user.get('mail') or '').lower()
             in_cognito = (
                 username in cognito_users or
-                email    in cognito_users
+                email    in cognito_users or
+                (email and email in cognito_emails)
             )
 
             if not in_cognito:
                 org_details = extract_org_details(fr_user)
-                uen         = org_details['uen'] or 'unassigned'
+                fr_org      = org_details['uen'] if org_details['uen'] not in ('', 'unassigned') else ''
+                fr5         = clean(fr_user.get('frUnindexedString5'))
+
+                # frUnindexedString5 is the firm field. The ForgeRock organisation object is only the fallback.
+                uen         = fr5 or fr_org or 'unassigned'
+                source      = 'frUnindexedString5' if fr5 else ('forgerockOrganisation' if fr_org else 'unassigned')
+                org_source[source] += 1
+                if fr5 and fr_org and fr5 != fr_org:
+                    conflicts.append({
+                        'userName':              clean(fr_user.get('userName')),
+                        'frUnindexedString5':    fr5,
+                        'forgerockOrganisation': fr_org
+                    })
 
                 missing.append({
-                    'userName':           fr_user.get('userName', ''),
-                    'email':              fr_user.get('mail', ''),
-                    'givenName':          fr_user.get('givenName', ''),
-                    'familyName':         fr_user.get('sn', ''),
+                    'userName':           clean(fr_user.get('userName')),
+                    'email':              clean(fr_user.get('mail')),
+                    'givenName':          clean(fr_user.get('givenName')),
+                    'familyName':         clean(fr_user.get('sn')),
                     'organisation':       uen,
                     'orgDisplayName':     org_details['displayName'],
                     'accountStatus':      fr_user.get('accountStatus', ''),
                     'country':            fr_user.get('country', ''),
-                    'frUnindexedString1': str(fr_user.get('frUnindexedString1', 'TRUE')),
-                    'frUnindexedString2': str(fr_user.get('frUnindexedString2', '')),
-                    'frUnindexedString5': str(fr_user.get('frUnindexedString5', ''))
+                    'frUnindexedString1': clean(fr_user.get('frUnindexedString1'), 'TRUE'),
+                    'frUnindexedString2': clean(fr_user.get('frUnindexedString2')),
+                    'frUnindexedString5': fr5
                 })
                 by_org[uen] = by_org.get(uen, 0) + 1
 
+        # users whose firm is not in BrokerFirms: they would be created WITHOUT a group
+        unknown_firms = None
+        if known_firms is not None:
+            unknown_firms = {}
+            for u in missing:
+                if u['organisation'] != 'unassigned' and u['organisation'] not in known_firms:
+                    unknown_firms[u['organisation']] = unknown_firms.get(u['organisation'], 0) + 1
+
         summary = {
-            'totalInForgeRock': len(fr_users),
-            'totalInCognito':   len(cognito_users),
-            'notInCognito':     len(missing),
-            'byOrganisation':   by_org
+            'totalInForgeRock':   len(fr_users),
+            'totalInCognito':     len(cognito_users),
+            'notInCognito':       len(missing),
+            'byOrganisation':     by_org,
+            'organisationSource': org_source,
+            'firmConflicts':      { 'count': len(conflicts), 'examples': conflicts[:20] },
+            'unknownFirms':       unknown_firms
         }
 
         bulk_payload = {
@@ -651,7 +694,8 @@ def handle_forgerock_gap(params, fmt):
                     'organisation':       u['organisation'],
                     'frUnindexedString1': u['frUnindexedString1'],
                     'frIndexedString2':   u['frUnindexedString2'],
-                    'frUnindexedString5': u['frUnindexedString5']
+                    'frUnindexedString5': u['frUnindexedString5'],
+                    'migrationType':      'BULK'
                 }
                 for u in missing
             ]
