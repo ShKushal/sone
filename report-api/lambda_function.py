@@ -552,11 +552,11 @@ def handle_forgerock_organisations(params, fmt):
                 continue
             fr_orgs.append({
                 'uen':         uen,
-                'name':        org.get('name', ''),
-                'displayName': org.get('displayName', ''),
-                'description': org.get('description', ''),
-                'address':     org.get('address', '') or '',
-                'country':     org.get('country', '')
+                'name':        org.get('name') or '',
+                'displayName': org.get('displayName') or '',
+                'description': org.get('description') or '',
+                'address':     org.get('address') or '',
+                'country':     org.get('country') or ''
             })
 
         existing_firms = table.scan().get('Items', [])
