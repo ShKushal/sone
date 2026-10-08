@@ -18,7 +18,7 @@ from email_template import PASSWORD_RESET_EMAIL_SUBJECT, PASSWORD_RESET_EMAIL_TE
 # -------------------------------------------------------
 # Config
 # -------------------------------------------------------
-USER_POOL_ID     = os.environ.get('USER_POOL_ID',     'ap-southeast-1_vi0pVitMh')
+USER_POOL_ID     = os.environ.get('USER_POOL_ID',     '')
 REGION           = os.environ.get('REGION',           'ap-southeast-1')
 DELETE_ENABLED   = os.environ.get('DELETE_ENABLED',   'false').lower() == 'true'
 TEMP_PHONE       = os.environ.get('TEMP_PHONE',       '+6500000000')
