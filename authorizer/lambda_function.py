@@ -7,7 +7,7 @@ import time
 import urllib.request
 
 VALID_API_KEY = os.environ.get('API_KEY',      '')
-USER_POOL_ID  = os.environ.get('USER_POOL_ID', 'ap-southeast-1_vi0pVitMh')
+USER_POOL_ID  = os.environ.get('USER_POOL_ID', '')
 REGION        = os.environ.get('REGION',       'ap-southeast-1')
 
 # App client IDs allowed to call this API with a USER token (comma-separated), e.g. the admin
