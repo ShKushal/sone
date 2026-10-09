@@ -5,8 +5,11 @@ Lambda response.
 """
 
 import os
+import re
 
 TEMP_PHONE = os.environ.get('TEMP_PHONE', '+6500000000')
+
+E164_PATTERN = re.compile(r"^\+[1-9]\d{6,14}$")
 
 
 # ============================================================
@@ -78,7 +81,14 @@ def _get_phone(user):
       - ""           → use placeholder
       - "+6512345678" → use as is (already E.164)
       - "6512345678"  → add + prefix
-      - "012-3456789" → strip dashes, add + prefix
+      - "0065-12345678" → strip dashes, 00 → +
+      - "012-3456789" → not E.164 (no country code)
+                         → use placeholder
+
+    Cognito rejects the whole migration when phone_number
+    is not valid E.164, and the user only sees "Incorrect
+    username or password", so anything that is still invalid
+    after cleaning falls back to the placeholder.
     """
     phone = user.get("telephoneNumber")
 
@@ -100,12 +110,24 @@ def _get_phone(user):
         .replace(".", "")
     )
 
-    # already E.164
-    if cleaned.startswith("+"):
-        return cleaned
+    # international dialling prefix
+    if cleaned.startswith("00"):
+        cleaned = "+" + cleaned[2:]
 
     # add + prefix
-    return "+" + cleaned
+    if not cleaned.startswith("+"):
+        cleaned = "+" + cleaned
+
+    if not E164_PATTERN.match(cleaned):
+
+        print(
+            "[PHONE] telephoneNumber is not valid E.164, "
+            "using placeholder"
+        )
+
+        return TEMP_PHONE
+
+    return cleaned
 
 
 # ============================================================
