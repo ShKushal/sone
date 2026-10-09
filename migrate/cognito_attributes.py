@@ -200,10 +200,10 @@ def build_cognito_attributes(user):
     attrs["custom:migrationType"] = "JIT"
 
     if broker_id:
-        attrs["custom:migrationBrokerId"] = broker_id
+        attrs["custom:organisation"] = broker_id
 
         print(
-            f"[GROUP] migrationBrokerId populated"
+            f"[GROUP] organisation populated"
         )
 
     return attrs

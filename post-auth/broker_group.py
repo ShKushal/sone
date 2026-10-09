@@ -4,7 +4,7 @@ from user_attributes import cognito
 
 logger = logging.getLogger()
 
-MIGRATION_BROKER_ID_ATTRIBUTE = "custom:migrationBrokerId"
+MIGRATION_BROKER_ID_ATTRIBUTE = "custom:organisation"
 
 
 def assign_broker_group(user_pool_id, username, attrs):
@@ -15,7 +15,7 @@ def assign_broker_group(user_pool_id, username, attrs):
     broker_id = (attrs.get(MIGRATION_BROKER_ID_ATTRIBUTE) or "").strip()
 
     if not broker_id:
-        logger.info("[GROUP] migrationBrokerId not found")
+        logger.info("[GROUP] organisation not found")
         return
 
     logger.info("[GROUP] Adding user to group: %s", broker_id)
@@ -33,7 +33,7 @@ def assign_broker_group(user_pool_id, username, attrs):
         # anyway. Warn so the missing group can be investigated.
         logger.warning(
             "[GROUP] Cognito group not found: %s. "
-            "Clearing migrationBrokerId without assignment",
+            "Clearing organisation without assignment",
             broker_id
         )
 
@@ -42,7 +42,7 @@ def assign_broker_group(user_pool_id, username, attrs):
         logger.exception("[GROUP] Failed to add user to group: %s", broker_id)
         return
 
-    _clear_broker_id(user_pool_id, username)
+    #_clear_broker_id(user_pool_id, username)
 
 
 def _clear_broker_id(user_pool_id, username):
