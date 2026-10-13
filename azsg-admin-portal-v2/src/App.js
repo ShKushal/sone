@@ -101,12 +101,16 @@ function Home() {
 // -------------------------------------------------------
 // Topbar
 // -------------------------------------------------------
+// The environment this build is for ("Dev", "Preprod", ...), set with REACT_APP_ENV_NAME.
+// Leave it unset to show no badge — e.g. in production.
+const ENV_NAME = (process.env.REACT_APP_ENV_NAME || '').trim();
+
 function Topbar({ title }) {
   return (
     <div className="topbar">
       <span className="page-title">{title}</span>
       <div className="topbar-right">
-        <span className="badge-env">Staging</span>
+        {ENV_NAME && <span className="badge-env">{ENV_NAME}</span>}
       </div>
     </div>
   );
