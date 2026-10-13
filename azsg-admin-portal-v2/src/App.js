@@ -46,7 +46,20 @@ function useIdleTimeout(minutes = 30) {
 // -------------------------------------------------------
 // Custom login header
 // -------------------------------------------------------
-const components = {};
+// A simple header on the sign-in card: the same name and mark as the sidebar
+const components = {
+  Header() {
+    return (
+      <div className="signin-header">
+        <img
+          className="signin-logo"
+          src={`${process.env.PUBLIC_URL}/allianz-logo.png`}
+          alt="Allianz"
+        />
+      </div>
+    );
+  },
+};
 
 // -------------------------------------------------------
 // Access denied

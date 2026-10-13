@@ -3,6 +3,7 @@ import { NavLink }                    from 'react-router-dom';
 import { signOut }                    from 'aws-amplify/auth';
 import { getUserGroups }              from '../hooks/useAuth';
 import { accessibleGroups, isSuperAdmin } from '../config/groups';
+import Icon                           from './Icon';
 
 export default function NavBar({ user }) {
   const [groups, setGroups] = useState([]);
@@ -62,7 +63,7 @@ export default function NavBar({ user }) {
                   'nav-item' + (isActive ? ' active' : '')
                 }
               >
-                <span className="nav-icon">{group.nav.icon}</span>
+                <span className="nav-icon"><Icon name={group.nav.icon} size={18} /></span>
                 {group.nav.label}
               </NavLink>
             ))}
@@ -88,9 +89,10 @@ export default function NavBar({ user }) {
           <button
             className="signout-btn"
             title="Sign out"
+            aria-label="Sign out"
             onClick={handleSignOut}
           >
-            ↩
+            <Icon name="logout" size={18} />
           </button>
         </div>
       </div>

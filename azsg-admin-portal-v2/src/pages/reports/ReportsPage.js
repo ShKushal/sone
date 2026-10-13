@@ -1,5 +1,6 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { getApiHeaders }                       from '../../hooks/useAuth';
+import { formatDate }                           from '../../utils/dates';
 
 const API_URL = process.env.REACT_APP_API_URL;
 const PAGE_SIZE = 10;
@@ -65,7 +66,7 @@ const COUNTRY_OPTIONS = [
   { value: 'DE', label: 'Germany' },
 ];
 
-function MultiSelect({ options, selected, onChange, placeholder, loading }) {
+function MultiSelect({ options, selected, onChange, placeholder, loading, loadingLabel = 'Loading…', error = false, errorLabel = "Couldn't load the list.", onRetry }) {
   const [open, setOpen] = useState(false);
   const ref             = useRef(null);
 
@@ -87,7 +88,20 @@ function MultiSelect({ options, selected, onChange, placeholder, loading }) {
       <div className={`multiselect-control${open ? ' open' : ''}`} onClick={() => setOpen(!open)}>
         <div className="multiselect-tags">
           {selected.length === 0
-            ? <span className="multiselect-placeholder">{loading ? 'Loading...' : placeholder}</span>
+            ? (error
+                ? (
+                  <span className="multiselect-error" role="alert">
+                    {errorLabel}{' '}
+                    <button
+                      type="button"
+                      className="multiselect-retry"
+                      onClick={e => { e.stopPropagation(); if (onRetry) onRetry(); }}
+                    >
+                      Retry
+                    </button>
+                  </span>
+                )
+                : <span className="multiselect-placeholder">{loading ? loadingLabel : placeholder}</span>)
             : selected.map(v => {
                 const opt = options.find(o => o.value === v);
                 return (
@@ -185,7 +199,7 @@ function PreviewTable({ report, rows, columns, page, setPage, total }) {
   const formatCell = (col, val) => {
     if (val === null || val === undefined || val === '') return '—';
     if (col === 'lastLogin' && val) {
-      try { return new Date(val).toLocaleDateString(); } catch { return val; }
+      return formatDate(val);
     }
     if (col === 'migratedPct') return `${Number(val).toFixed(1)}%`;
     if (col === 'memberCount' || col === 'total' || col === 'migrated' || col === 'pendingMigration') {
@@ -207,7 +221,7 @@ function PreviewTable({ report, rows, columns, page, setPage, total }) {
       <span style={{
         background: s.bg, color: s.color,
         padding: '2px 8px', borderRadius: 20,
-        fontSize: 11, fontWeight: 600, whiteSpace: 'nowrap'
+        fontSize: 12, fontWeight: 600, whiteSpace: 'nowrap'
       }}>
         {status.replace(/_/g, ' ')}
       </span>
@@ -233,7 +247,7 @@ function PreviewTable({ report, rows, columns, page, setPage, total }) {
                 <th key={col} style={{
                   padding: '10px 14px', textAlign: 'left',
                   fontWeight: 600, color: '#52637a',
-                  fontSize: 11, textTransform: 'uppercase',
+                  fontSize: 12, textTransform: 'uppercase',
                   letterSpacing: '.4px', whiteSpace: 'nowrap'
                 }}>
                   {colLabel(col)}
@@ -262,7 +276,7 @@ function PreviewTable({ report, rows, columns, page, setPage, total }) {
       </div>
       {pages > 1 && (
         <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '12px 18px', borderTop: '1px solid #eef1f6' }}>
-          <span style={{ fontSize: 12, color: '#8e9bb0' }}>
+          <span style={{ fontSize: 12, color: 'var(--text-muted)' }}>
             Showing {start + 1}–{Math.min(start + PAGE_SIZE, rows.length)} of {rows.length}
           </span>
           <div style={{ display: 'flex', gap: 6 }}>
@@ -336,7 +350,7 @@ function ReportSection({ report, filters }) {
         <div className="report-info">
           <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
             <span style={{
-              fontSize: 11, color: '#8e9bb0',
+              fontSize: 12, color: 'var(--text-muted)',
               transition: 'transform 160ms',
               display: 'inline-block',
               transform: collapsed ? 'rotate(-90deg)' : 'rotate(0deg)'
@@ -344,7 +358,7 @@ function ReportSection({ report, filters }) {
             <div className="report-label">{report.label}</div>
             {state === 'done' && rows.length > 0 && (
               <span style={{
-                fontSize: 11, color: '#003781',
+                fontSize: 12, color: '#003781',
                 background: '#e8edf5', padding: '1px 7px',
                 borderRadius: 20, fontWeight: 600
               }}>
@@ -355,6 +369,7 @@ function ReportSection({ report, filters }) {
           {!collapsed && <div className="report-desc">{report.description}</div>}
         </div>
         <div
+          className="report-actions"
           style={{ display: 'flex', gap: 8, flexShrink: 0 }}
           onClick={e => e.stopPropagation()}
         >
@@ -373,13 +388,13 @@ function ReportSection({ report, filters }) {
           {dlError && <div style={{ padding: '10px 18px', color: '#991b1b', background: '#fee2e2', fontSize: 13 }}>{dlError}</div>}
 
           {state === 'loading' && (
-            <div style={{ padding: '24px', textAlign: 'center', color: '#8e9bb0', fontSize: 13 }}>
+            <div style={{ padding: '24px', textAlign: 'center', color: 'var(--text-muted)', fontSize: 13 }}>
               Loading data...
             </div>
           )}
 
           {state === 'done' && rows.length === 0 && (
-            <div style={{ padding: '24px', textAlign: 'center', color: '#8e9bb0', fontSize: 13 }}>
+            <div style={{ padding: '24px', textAlign: 'center', color: 'var(--text-muted)', fontSize: 13 }}>
               No results found for the selected filters
             </div>
           )}
@@ -407,31 +422,35 @@ export default function ReportsPage() {
   });
   const [orgOptions,  setOrgOptions]  = useState([]);
   const [loadingOrgs, setLoadingOrgs] = useState(true);
+  const [orgsError,   setOrgsError]   = useState(false);
   const [presetType,  setPresetType]  = useState('created'); // 'created' or 'lastLogin'
 
-  useEffect(() => {
-    const loadOrgs = async () => {
-      try {
-        const headers = await getApiHeaders();
-        const r       = await fetch(`${API_URL}/broker-firms`, { headers });
-        const data    = await r.json();
-        // handle array or object response
-        const firms   = Array.isArray(data) ? data : (data.firms || data.items || []);
-        setOrgOptions(
-          firms.map(f => ({
-            value: f.UEN || f.uen || '',
-            label: f.displayName || f.name || '',
-            sub:   f.UEN || f.uen || ''
-          }))
-        );
-      } catch (e) {
-        console.error('Failed to load orgs:', e);
-      } finally {
-        setLoadingOrgs(false);
-      }
-    };
-    loadOrgs();
+  const loadOrgs = useCallback(async () => {
+    setLoadingOrgs(true);
+    setOrgsError(false);
+    try {
+      const headers = await getApiHeaders();
+      const r       = await fetch(`${API_URL}/broker-firms`, { headers });
+      if (!r.ok) throw new Error(`Server error: ${r.status}`);
+      const data    = await r.json();
+      // handle array or object response
+      const firms   = Array.isArray(data) ? data : (data.firms || data.items || []);
+      setOrgOptions(
+        firms.map(f => ({
+          value: f.UEN || f.uen || '',
+          label: f.displayName || f.name || '',
+          sub:   f.UEN || f.uen || ''
+        }))
+      );
+    } catch (e) {
+      console.error('Failed to load orgs:', e);
+      setOrgsError(true);
+    } finally {
+      setLoadingOrgs(false);
+    }
   }, []);
+
+  useEffect(() => { loadOrgs(); }, [loadOrgs]);
 
   const set   = (key, val) => setFilters(prev => ({ ...prev, [key]: val }));
   const clear = () => setFilters({ organisations: [], statuses: [], countries: [], fromDate: '', toDate: '', lastLoginFrom: '', lastLoginTo: '', search: '' });
@@ -445,6 +464,11 @@ export default function ReportsPage() {
 
   return (
     <div className="page">
+
+      <p className="page-intro-text">
+        Set filters if you need them, then run a report to preview it, or download it as a CSV file.
+        Filters apply to every report below except the temporary ForgeRock ones.
+      </p>
 
       <div className="filter-panel">
         <div className="filter-header">
@@ -508,7 +532,7 @@ export default function ReportsPage() {
         <div className="filters-grid">
           <div className="filter-group">
             <label>Organisation</label>
-            <MultiSelect options={orgOptions} selected={filters.organisations} onChange={v => set('organisations', v)} placeholder="All organisations" loading={loadingOrgs} />
+            <MultiSelect options={orgOptions} selected={filters.organisations} onChange={v => set('organisations', v)} placeholder="All organisations" loading={loadingOrgs} loadingLabel="Loading organisations…" error={orgsError} errorLabel="Couldn't load organisations." onRetry={loadOrgs} />
           </div>
           <div className="filter-group">
             <label>Status</label>
@@ -542,7 +566,7 @@ export default function ReportsPage() {
       </div>
 
       <div className="section-header">
-        <span className="section-title">Reports</span>
+        <span className="section-title">Choose a report</span>
       </div>
       <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
         {PERMANENT_REPORTS.map(r => (

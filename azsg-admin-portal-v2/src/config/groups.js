@@ -13,7 +13,7 @@ const GROUPS = {
     label: 'Reports Admin',
     route: '/reports',
     nav: {
-      icon:  '📊',
+      icon:  'chart',
       label: 'Reports',
       section: 'Reporting'
     }
@@ -23,7 +23,7 @@ const GROUPS = {
     label: 'Helpdesk',
     route: '/helpdesk',
     nav: {
-      icon:  '🛠',
+      icon:  'lifebuoy',
       label: 'Helpdesk',
       section: 'Support'
     }
@@ -33,7 +33,7 @@ const GROUPS = {
     label: 'Email Logs',
     route: '/email-logs',
     nav: {
-      icon:  '✉️',
+      icon:  'mail',
       label: 'Email Logs',
       section: 'Monitoring'
     }

@@ -1,4 +1,5 @@
 import React from 'react';
+import Icon  from './Icon';
 
 export default class ErrorBoundary extends React.Component {
   constructor(props) {
@@ -34,7 +35,7 @@ export default class ErrorBoundary extends React.Component {
           borderRadius:  '10px',
           boxShadow:     '0 4px 16px rgba(0,55,129,.06)'
         }}>
-          <div style={{ fontSize: 36, marginBottom: 16 }}>⚠️</div>
+          <div style={{ marginBottom: 16, color: 'var(--amber)' }}><Icon name="alert" size={40} /></div>
           <h2 style={{ fontSize: 18, fontWeight: 700, color: '#111827', marginBottom: 8 }}>
             Something went wrong
           </h2>
@@ -43,7 +44,7 @@ export default class ErrorBoundary extends React.Component {
             If the problem persists, contact your administrator.
           </p>
           {this.state.error && (
-            <p style={{ fontSize: 11, color: '#8e9bb0', marginBottom: 20, fontFamily: 'monospace' }}>
+            <p style={{ fontSize: 12, color: 'var(--text-muted)', marginBottom: 20, fontFamily: 'monospace' }}>
               {this.state.error.message}
             </p>
           )}

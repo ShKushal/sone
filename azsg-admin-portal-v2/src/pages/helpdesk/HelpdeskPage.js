@@ -1,10 +1,13 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { getApiHeaders, getCurrentUser } from '../../hooks/useAuth';
 import GROUPS, { isSuperAdmin, SUPER_ADMIN } from '../../config/groups';
+import DateTime                          from '../../components/DateTime';
+import Icon                              from '../../components/Icon';
 import { fetchAuthSession }            from 'aws-amplify/auth';
 
 const API_URL  = process.env.REACT_APP_API_URL;
 const PER_PAGE = 10;
+const GROUPS_SLOW_MS = 8000;      // after this long without an answer, say so and offer Retry
 
 // TEMPORARY copy of the limit set in the email logger Lambda's environment variables
 // (it sets custom:emailBlocked once custom:emailFailCount reaches it). Display only —
@@ -278,7 +281,7 @@ function EmailLogs({ username, refresh, onLoaded, onManualRefresh }) {
           {!loading && <span className="logs-count">{logs.length}</span>}
           {!open && !loading && logs.length > 0 && (
             <span className="logs-latest">
-              Latest: {eventIcon(logs[0].eventType)} {logs[0].eventType} · {new Date(logs[0].timestamp).toLocaleString()}
+              Latest: {eventIcon(logs[0].eventType)} {logs[0].eventType} · <DateTime value={logs[0].timestamp} seconds />
             </span>
           )}
         </button>
@@ -288,7 +291,7 @@ function EmailLogs({ username, refresh, onLoaded, onManualRefresh }) {
               <span className="logs-updated failed">Refresh failed — try again</span>
             )}
             {!refreshing && !refreshFailed && updatedAt && (
-              <span className="logs-updated">Updated {updatedAt.toLocaleTimeString()}</span>
+              <span className="logs-updated">Updated <DateTime value={updatedAt} timeOnly /></span>
             )}
             <button
               className="btn-link"
@@ -304,12 +307,12 @@ function EmailLogs({ username, refresh, onLoaded, onManualRefresh }) {
         )}
       </div>
       {open && loading && (
-        <p style={{ fontSize: 12, color: 'var(--grey-400)', padding: '8px 0' }}>
+        <p style={{ fontSize: 12, color: 'var(--text-muted)', padding: '8px 0' }}>
           Loading...
         </p>
       )}
       {open && !loading && logs.length === 0 && (
-        <p style={{ fontSize: 12, color: 'var(--grey-400)', padding: '8px 0' }}>
+        <p style={{ fontSize: 12, color: 'var(--text-muted)', padding: '8px 0' }}>
           No email logs found
         </p>
       )}
@@ -323,7 +326,7 @@ function EmailLogs({ username, refresh, onLoaded, onManualRefresh }) {
               <div className="log-detail">
                 <span className="log-by">{log.subject || '—'}</span>
                 <span className="log-time">
-                  {new Date(log.timestamp).toLocaleString()}
+                  <DateTime value={log.timestamp} seconds />
                 </span>
               </div>
             </div>
@@ -337,7 +340,7 @@ function EmailLogs({ username, refresh, onLoaded, onManualRefresh }) {
 // -------------------------------------------------------
 // A labelled row of group chips
 //   access        = portal groups, on the explicit MANAGEABLE_GROUPS list (the only ones managed here)
-//   organisation  = the group named by the user's own custom:organisation value
+//   organisation  = a group named by the user's organisation (frUnindexedString5; the older custom:organisation also counts)
 //   other         = anything else — read-only, and worth a look (e.g. a firm group left over after a change)
 // Cognito has no "type" on a group, so nothing is guessed from a name.
 // -------------------------------------------------------
@@ -470,6 +473,16 @@ function UserCard({ user, onRefresh }) {
   // ---- groups ------------------------------------------------------------------------------------------
   const [groupsInfo,    setGroupsInfo]    = useState(null);   // { groups, manageable } | { error }
   const [groupsVersion, setGroupsVersion] = useState(0);
+  const [groupsSlow,    setGroupsSlow]    = useState(false);
+  const retryGroups = () => { setGroupsInfo(null); setGroupsVersion(v => v + 1); };
+
+  // still waiting after a while: say so, and offer Retry (the answer may still arrive on its own)
+  useEffect(() => {
+    setGroupsSlow(false);
+    if (groupsInfo) return undefined;
+    const timer = setTimeout(() => setGroupsSlow(true), GROUPS_SLOW_MS);
+    return () => clearTimeout(timer);
+  }, [groupsInfo, groupsVersion]);
   const [managing,      setManaging]      = useState(false);
   const [groupPick,     setGroupPick]     = useState([]);
 
@@ -485,9 +498,13 @@ function UserCard({ user, onRefresh }) {
   const hints         = groupsInfo?.hints || {};     // each portal group's own description, from Cognito
   const manageable    = groupsInfo?.manageable || [];
   const currentPortal = (groupsInfo?.groups || []).filter(g => manageable.includes(g));
-  const orgName       = attrs['custom:organisation'] || '';
-  const orgGroups     = (groupsInfo?.groups || []).filter(g => !manageable.includes(g) &&  orgName && g === orgName);
-  const otherGroups   = (groupsInfo?.groups || []).filter(g => !manageable.includes(g) && g !== orgName);
+  // frUnindexedString5 is the source of truth for a user's organisation. The older custom:organisation is only a
+  // fallback (users migrated earlier have it): it is shown when frUnindexedString5 is empty, and a group named by
+  // either value is recognised as the user's organisation group.
+  const organisation  = attrs['custom:frUnindexedString5'] || attrs['custom:organisation'] || '';
+  const orgNames      = [attrs['custom:frUnindexedString5'], attrs['custom:organisation']].filter(Boolean);
+  const orgGroups     = (groupsInfo?.groups || []).filter(g => !manageable.includes(g) &&  orgNames.includes(g));
+  const otherGroups   = (groupsInfo?.groups || []).filter(g => !manageable.includes(g) && !orgNames.includes(g));
   const groupAdd      = groupPick.filter(g => !currentPortal.includes(g));
   const groupRemove   = currentPortal.filter(g => !groupPick.includes(g));
   const groupsDirty   = groupAdd.length + groupRemove.length > 0;
@@ -773,7 +790,7 @@ function UserCard({ user, onRefresh }) {
                 <span className="detail-value">{attrs.email || user.userName}</span>
               </Row>
               <Row label="Organisation">
-                <span className="detail-value">{attrs['custom:organisation'] || EMPTY}</span>
+                <span className="detail-value">{organisation || EMPTY}</span>
               </Row>
             </div>
 
@@ -807,7 +824,7 @@ function UserCard({ user, onRefresh }) {
             <Row label="Last Login">
               <span className="detail-value">
                 {attrs['custom:lastLogin']
-                  ? new Date(attrs['custom:lastLogin']).toLocaleString()
+                  ? <DateTime value={attrs['custom:lastLogin']} />
                   : 'Never'
                 }
               </span>
@@ -817,7 +834,7 @@ function UserCard({ user, onRefresh }) {
             </Row>
             <Row label="Created">
               <span className="detail-value">
-                {new Date(user.createdAt).toLocaleDateString()}
+                <DateTime value={user.createdAt} dateOnly />
               </span>
             </Row>
             <Row label="Email delivery">
@@ -843,8 +860,29 @@ function UserCard({ user, onRefresh }) {
             )}
           </div>
 
-          {!groupsInfo && <div className="field-hint">Loading…</div>}
-          {groupsInfo?.error && <div className="field-hint">Could not load groups: {groupsInfo.error}</div>}
+          {!groupsInfo && (
+            <div className="groups-loading" role="status" aria-live="polite">
+              <span className="visually-hidden">Loading groups…</span>
+              <div className="skeleton-row" aria-hidden="true">
+                <span className="skeleton skeleton-label" /><span className="skeleton skeleton-chip" /><span className="skeleton skeleton-chip" />
+              </div>
+              <div className="skeleton-row" aria-hidden="true">
+                <span className="skeleton skeleton-label" /><span className="skeleton skeleton-chip" />
+              </div>
+              {groupsSlow && (
+                <div className="field-hint">
+                  This is taking longer than usual.{' '}
+                  <button type="button" className="btn-link" onClick={retryGroups}>Retry</button>
+                </div>
+              )}
+            </div>
+          )}
+          {groupsInfo?.error && (
+            <div className="field-hint" role="alert">
+              Could not load groups: {groupsInfo.error}{' '}
+              <button type="button" className="btn-link" onClick={retryGroups}>Retry</button>
+            </div>
+          )}
 
           {groupsInfo?.groups && !managing && (
             <div className="group-rows">
@@ -1003,7 +1041,7 @@ function UserList({ onSelect, selectedUser }) {
     <div className="user-list-panel">
       <div className="user-list-header">
         <span className="user-list-title">All Users</span>
-        <span style={{ fontSize: 12, color: 'var(--grey-400)' }}>
+        <span style={{ fontSize: 12, color: 'var(--text-muted)' }}>
           Page {currentPage + 1}
         </span>
       </div>
@@ -1036,11 +1074,11 @@ function UserList({ onSelect, selectedUser }) {
             </div>
             <div style={{ flexShrink: 0, display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: 4 }}>
               <span className={`badge ${user.enabled ? 'badge-green' : 'badge-red'}`}
-                style={{ fontSize: 10 }}>
+                style={{ fontSize: 12 }}>
                 {user.enabled ? 'Enabled' : 'Disabled'}
               </span>
               {blocked && (
-                <span className="badge badge-red" style={{ fontSize: 10 }}>
+                <span className="badge badge-red" style={{ fontSize: 12 }}>
                   Email blocked
                 </span>
               )}
@@ -1050,7 +1088,7 @@ function UserList({ onSelect, selectedUser }) {
       })}
 
       {!loading && users.length === 0 && !error && (
-        <div style={{ padding: '24px', textAlign: 'center', color: 'var(--grey-400)', fontSize: 13 }}>
+        <div style={{ padding: '24px', textAlign: 'center', color: 'var(--text-muted)', fontSize: 13 }}>
           No users found
         </div>
       )}
@@ -1064,7 +1102,7 @@ function UserList({ onSelect, selectedUser }) {
         >
           ← Prev
         </button>
-        <span style={{ fontSize: 12, color: 'var(--grey-400)' }}>
+        <span style={{ fontSize: 12, color: 'var(--text-muted)' }}>
           Page {currentPage + 1}
         </span>
         <button
@@ -1165,8 +1203,8 @@ export default function HelpdeskPage() {
 
           {!loadingUser && !selectedUser && (
             <div className="helpdesk-empty">
-              <div style={{ fontSize: 32, marginBottom: 12 }}>👤</div>
-              <div style={{ fontSize: 14, color: 'var(--grey-400)' }}>
+              <div style={{ marginBottom: 12, color: 'var(--text-muted)' }}><Icon name="user" size={36} /></div>
+              <div style={{ fontSize: 14, color: 'var(--text-muted)' }}>
                 Select a user from the list or search by email
               </div>
             </div>

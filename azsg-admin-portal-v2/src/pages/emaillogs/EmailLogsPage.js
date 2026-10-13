@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { getApiHeaders }                                    from '../../hooks/useAuth';
+import { formatDateTime, formatTimeOfDay }                  from '../../utils/dates';
 
 const API_URL = process.env.REACT_APP_API_URL;
 
@@ -85,8 +86,7 @@ const eventTime = item => detailsOf(item).timestamp || item.timestamp || '';
 
 function formatTime(value) {
   if (!value) return '—';
-  const date = new Date(value);
-  return Number.isNaN(date.getTime()) ? String(value) : date.toLocaleString();
+  return formatDateTime(value, { seconds: true });       // the viewer's own time zone, stated
 }
 
 const rowKey = item => `${item.email}|${item.timestamp}|${item.eventType}|${item.messageId || ''}`;
@@ -370,7 +370,7 @@ export default function EmailLogsPage() {
           </div>
           <div className="logs-refresh">
             {!refreshing && updatedAt && (
-              <span className="logs-updated">Updated {updatedAt.toLocaleTimeString()}</span>
+              <span className="logs-updated">Updated {formatTimeOfDay(updatedAt)}</span>
             )}
             <button className="btn-link" onClick={() => load(true)} disabled={refreshing} aria-busy={refreshing}>
               {refreshing ? <><span className="spinner" aria-hidden="true" />Refreshing…</> : '↻ Refresh'}
