@@ -13,7 +13,17 @@
   "scripts": {
     "start": "react-scripts start",
     "build": "react-scripts build",
-    "test": "react-scripts test"
+    "test": "react-scripts test",
+
+    "start:scc-preprod": "env-cmd -f .env.scc.preprod react-scripts start",
+    "start:scc-prod": "env-cmd -f .env.scc.prod react-scripts start",
+    "start:sccplus-nonprod": "env-cmd -f .env.sccplus.nonprod react-scripts start",
+    "start:sccplus-prod": "env-cmd -f .env.sccplus.prod react-scripts start",
+
+    "build:scc-preprod": "env-cmd -f .env.scc.preprod react-scripts build",
+    "build:scc-prod": "env-cmd -f .env.scc.prod react-scripts build",
+    "build:sccplus-nonprod": "env-cmd -f .env.sccplus.nonprod react-scripts build",
+    "build:sccplus-prod": "env-cmd -f .env.sccplus.prod react-scripts build"
   },
   "browserslist": {
     "production": [
@@ -24,5 +34,8 @@
     "development": [
       "last 1 chrome version"
     ]
+  },
+  "devDependencies": {
+    "env-cmd": "^11.0.0"
   }
 }
