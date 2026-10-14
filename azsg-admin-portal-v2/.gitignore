@@ -26,7 +26,3 @@ yarn-error.log*
 .env.local
 .env.production
 build.zip
-.env.scc.preprod
-.env.scc.prod
-.env.sccplus.nonprod
-.env.sccplus.prod
