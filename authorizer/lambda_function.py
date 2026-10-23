@@ -23,6 +23,54 @@ JWKS_URL = f'{ISSUER}/.well-known/jwks.json'
 # PKCS#1 v1.5 DigestInfo prefix for SHA-256 (RFC 8017, section 9.2)
 SHA256_DIGEST_INFO = bytes.fromhex('3031300d060960864801650304020105000420')
 
+# -------------------------------------------------------
+# Who may call which route — for people signing in with a token.
+# A call with the API key is trusted on every route and never looks at this table.
+# A route that is not in this table is refused for token callers (so a new route is closed until
+# it is listed here). The group names are the portal groups; users-api repeats the user rules
+# and adds the finer ones (own account, which fields) that need the request body.
+# -------------------------------------------------------
+SUPER_ADMIN = 'SUPER_ADMIN'
+ADMIN_ONLY  = frozenset({SUPER_ADMIN})
+HELPDESK    = frozenset({'HELPDESK',      SUPER_ADMIN})
+REPORTS     = frozenset({'REPORTS_ADMIN', SUPER_ADMIN})
+EMAIL_LOGS  = frozenset({'EMAIL_LOGS',    SUPER_ADMIN})
+
+ROUTE_GROUPS = {
+    # users
+    'GET /users':                              HELPDESK,
+    'GET /users/{username}':                   HELPDESK,
+    'GET /users/{username}/email-logs':        HELPDESK,
+    'GET /users/{username}/groups':            HELPDESK,
+    'PUT /users/{username}':                   HELPDESK,
+    'POST /users/{username}/reset-password':   HELPDESK,
+    'POST /users/{username}/email-unblock':    HELPDESK,
+    'PUT /users/{username}/groups':            ADMIN_ONLY,
+    'POST /users':                             ADMIN_ONLY,
+    'POST /users/bulk':                        ADMIN_ONLY,
+    'DELETE /users/{username}':                ADMIN_ONLY,
+    # email logs for all recipients
+    'GET /email-logs':                         EMAIL_LOGS,
+    # reports (including the temporary ForgeRock ones)
+    'GET /reports/users':                      REPORTS,
+    'GET /reports/users/summary':              REPORTS,
+    'GET /reports/inactive':                   REPORTS,
+    'GET /reports/organisations':              REPORTS,
+    'GET /reports/migration':                  REPORTS,
+    'GET /reports/migration/pending':          REPORTS,
+    'GET /reports/migration/complete':         REPORTS,
+    'GET /reports/migration/summary':          REPORTS,
+    'GET /reports/forgerock/organisations':    REPORTS,
+    'GET /reports/forgerock/gap':              REPORTS,
+    # broker firms: reading for the reports group, every change for super admin only
+    'GET /broker-firms':                       REPORTS,
+    'GET /broker-firms/{brokerId}':            REPORTS,
+    'POST /broker-firms':                      ADMIN_ONLY,
+    'POST /broker-firms/bulk':                 ADMIN_ONLY,
+    'PUT /broker-firms/{brokerId}':            ADMIN_ONLY,
+    'DELETE /broker-firms/{brokerId}':         ADMIN_ONLY,
+}
+
 JWKS_REFETCH_MIN_SECONDS = 60   # an unknown key id may be a rotation — but never refetch on every request
 
 # kept across warm invocations
@@ -136,12 +184,16 @@ def validate_jwt(token):
         payload.get('sub') or
         'jwt-user'
     )
-    return { 'valid': True, 'principal': principal }
+    # Cognito lists the user's groups in the token; anything that is not a list of names counts as no groups
+    raw_groups = payload.get('cognito:groups')
+    groups     = [g for g in raw_groups if isinstance(g, str)] if isinstance(raw_groups, list) else []
+    return { 'valid': True, 'principal': principal, 'groups': groups }
 
 
 def lambda_handler(event, context):
     # Never log the whole event: it carries the Authorization token and the x-api-key value.
-    print(f"[AUTH] {event.get('routeKey') or event.get('requestContext', {}).get('http', {}).get('path', '?')}")
+    route = event.get('routeKey') or '?'
+    print(f'[AUTH] {route}')
 
     headers     = { str(k).lower(): v for k, v in (event.get('headers') or {}).items() }
     api_key     = headers.get('x-api-key', '')
@@ -150,13 +202,23 @@ def lambda_handler(event, context):
     # React app — x-api-key: jwt + Bearer token
     if api_key == 'jwt' and auth_header.startswith('Bearer '):
         result = validate_jwt(auth_header[7:])
-        if result['valid']:
-            print(f"[AUTH] JWT valid for: {result['principal']}")
-            return allow(result['principal'], 'jwt')
-        print(f"[AUTH] JWT invalid: {result['error']}")
-        return deny()
+        if not result['valid']:
+            print(f"[AUTH] JWT invalid: {result['error']}")
+            return deny()
 
-    # Postman / backend — the real API key
+        # a valid token is not enough: the person must hold a group this route allows
+        needed = ROUTE_GROUPS.get(route)
+        if needed is None:
+            print(f"[AUTH] Refused {result['principal']}: no rule for route {route}")
+            return deny()
+        if not needed.intersection(result['groups']):
+            print(f"[AUTH] Refused {result['principal']} on {route}: needs one of {sorted(needed)}")
+            return deny()
+
+        print(f"[AUTH] JWT valid for: {result['principal']}")
+        return allow(result['principal'], 'jwt', result['groups'])
+
+    # Postman / backend — the real API key. Trusted on every route: the route table does not apply.
     if api_key and VALID_API_KEY and hmac.compare_digest(api_key.encode('utf-8'), VALID_API_KEY.encode('utf-8')):
         print('[AUTH] API key valid')
         return allow('api-key-client', 'api-key')
@@ -165,13 +227,14 @@ def lambda_handler(event, context):
     return deny()
 
 
-def allow(principal, auth_type):
+def allow(principal, auth_type, groups=()):
     return {
         'isAuthorized': True,
         'context': {
             'apiKey':    'valid',
             'principal': principal,
-            'authType':  auth_type
+            'authType':  auth_type,
+            'groups':    ','.join(sorted(groups))     # verified groups of a token caller; empty for the API key
         }
     }
 
