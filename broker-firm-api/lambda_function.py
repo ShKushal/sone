@@ -311,7 +311,7 @@ def delete_broker_firm(uen):
 # Lambda handler
 # -------------------------------------------------------
 def lambda_handler(event, context):
-    print('Event:', json.dumps(event))
+
     try:
         return route(event)
     except BadRequest as e:

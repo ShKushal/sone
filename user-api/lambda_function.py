@@ -1084,7 +1084,7 @@ def search_email_logs(params, context=None):
 # Lambda handler
 # -------------------------------------------------------
 def lambda_handler(event, context):
-    print('Event:', json.dumps(event))
+
     try:
         return route(event, context)
     except BadRequest as e:

@@ -725,7 +725,6 @@ def handle_forgerock_gap(params, fmt):
 # Lambda handler
 # -------------------------------------------------------
 def lambda_handler(event, context):
-    print('Event:', json.dumps(event))
 
     route_key = event.get('routeKey', 'GET /reports/users')
     method    = route_key.split(' ')[0]
