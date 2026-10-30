@@ -72,63 +72,28 @@ def lambda_handler(
     # FORGOT PASSWORD
     # ========================================================
 
+    # Users must be migrated through a successful login
+    # first. Cognito invokes this trigger whenever a reset
+    # is requested for a user not yet in the pool. We raise
+    # instead of returning: an empty response becomes a
+    # UserNotFoundException, which PreventUserExistenceErrors
+    # masks as a successful code delivery, so the UI would
+    # still move to the "enter code" screen. A raised error
+    # surfaces as UserLambdaValidationException and stops
+    # the flow.
+
     if trigger == "UserMigration_ForgotPassword":
 
         print(
             "[MIGRATION] "
-            "Forgot password migration"
+            "Forgot password migration blocked: "
+            "user not yet migrated"
         )
 
-        user = load_user_profile(
-            username
+        raise Exception(
+            "Please sign in with your existing "
+            "password before resetting it"
         )
-
-        if not user:
-
-            print(
-                "[MIGRATION] "
-                "User not found"
-            )
-
-            return event
-
-        attrs = {}
-
-        email = user.get(
-            "mail"
-        )
-
-        if email:
-
-            attrs["email"] = str(
-                email
-            )
-
-            attrs["email_verified"] = "true"
-
-        event["response"] = {
-
-            "userAttributes":
-                attrs
-        }
-
-        print(
-            "[COGNITO] "
-            "Forgot password attributes:",
-            list(attrs.keys())
-        )
-
-        total_time = int(
-            (time.time() - start_time)
-            * 1000
-        )
-
-        print(
-            f"[MIGRATION] COMPLETE: "
-            f"total_time_ms={total_time}"
-        )
-
-        return event
 
     # ========================================================
     # USER MIGRATION AUTHENTICATION
