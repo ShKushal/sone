@@ -6,6 +6,7 @@ On every login:
     2. sends the account confirmation email on the first login after
        an invitation
     3. records the login in custom:lastLogin
+    4. makes email the preferred MFA method for broker users (never blocks login)
 
 Handler: postAuth.lambda_handler
 
@@ -15,6 +16,7 @@ Modules:
     email_template       confirmation email subject + HTML
     confirmation_email   rendering + SES send
     broker_group         custom:migrationBrokerId -> Cognito group
+    mfa_preference       email as the preferred MFA method
     user_attributes      custom:userOperation / custom:lastLogin
     invocation_logging   event + context logging
 """
@@ -25,6 +27,7 @@ import time
 from broker_group import assign_broker_group
 from confirmation_email import render_email, send_confirmation_email
 from invocation_logging import log_invocation
+from mfa_preference import ensure_email_mfa
 from user_attributes import (
     clear_user_operation,
     is_email_blocked,
@@ -50,6 +53,7 @@ def lambda_handler(event, context):
     user_pool_id = event["userPoolId"]
     username = event["userName"]
 
+    ensure_email_mfa(user_pool_id, username, attrs)
     assign_broker_group(user_pool_id, username, attrs)
 
     updates = [last_login_update()]

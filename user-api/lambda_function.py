@@ -245,6 +245,19 @@ def create_user(user):
         )
         print(f"Cognito user created: {username}")
 
+        # email is the only MFA method (email_verified is set above);
+        # SMS is disabled so codes never go to the TEMP_PHONE placeholder
+        try:
+            cognito.admin_set_user_mfa_preference(
+                UserPoolId=USER_POOL_ID,
+                Username=username,
+                EmailMfaSettings={ 'Enabled': True,  'PreferredMfa': True },
+                SMSMfaSettings={   'Enabled': False, 'PreferredMfa': False }
+            )
+            print(f"Email MFA set as preferred for: {username}")
+        except Exception as e:
+            print(f"MFA preference warning for {username}: {e}")
+
         if not is_active:
             cognito.admin_disable_user(UserPoolId=USER_POOL_ID, Username=username)
             print(f"User disabled: {username}")
