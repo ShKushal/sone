@@ -17,12 +17,14 @@
 
     "start:scc-preprod": "env-cmd -f .env.scc.preprod react-scripts start",
     "start:scc-prod": "env-cmd -f .env.scc.prod react-scripts start",
-    "start:sccplus-nonprod": "env-cmd -f .env.sccplus.nonprod react-scripts start",
+    "start:sccplus-dev": "env-cmd -f .env.sccplus.dev react-scripts start",
+    "start:sccplus-preprod": "env-cmd -f .env.sccplus.preprod react-scripts start",
     "start:sccplus-prod": "env-cmd -f .env.sccplus.prod react-scripts start",
 
     "build:scc-preprod": "env-cmd -f .env.scc.preprod react-scripts build",
     "build:scc-prod": "env-cmd -f .env.scc.prod react-scripts build",
-    "build:sccplus-nonprod": "env-cmd -f .env.sccplus.nonprod react-scripts build",
+    "build:sccplus-dev": "env-cmd -f .env.sccplus.dev react-scripts build",
+    "build:sccplus-preprod": "env-cmd -f .env.sccplus.preprod react-scripts build",
     "build:sccplus-prod": "env-cmd -f .env.sccplus.prod react-scripts build"
   },
   "browserslist": {
