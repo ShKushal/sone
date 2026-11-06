@@ -20,6 +20,27 @@ ALLOWED_CLIENT_IDS = {
 ISSUER   = f'https://cognito-idp.{REGION}.amazonaws.com/{USER_POOL_ID}'
 JWKS_URL = f'{ISSUER}/.well-known/jwks.json'
 
+# Portal users signing in with a Cognito token (the old portal sign-in). Set ACCEPT_COGNITO_TOKENS
+# to "false" once the portal signs in with Microsoft Entra ID only.
+ACCEPT_COGNITO_TOKENS = bool(USER_POOL_ID) and \
+    os.environ.get('ACCEPT_COGNITO_TOKENS', 'true').strip().lower() != 'false'
+
+# -------------------------------------------------------
+# Employees signing in with Microsoft Entra ID (MSAL in the portal).
+# The portal asks Entra for an access token for OUR app registration ("Expose an API" scope);
+# the token is checked here like a Cognito token: signature against Microsoft's published keys,
+# then issuer, tenant, audience, scope, expiry. The app roles in the token ("roles") take the
+# place of the Cognito groups in the route table below. Leave ENTRA_TENANT_ID or ENTRA_CLIENT_ID
+# empty to refuse every Entra token.
+# -------------------------------------------------------
+ENTRA_TENANT_ID = os.environ.get('ENTRA_TENANT_ID', '').strip().lower()
+ENTRA_CLIENT_ID = os.environ.get('ENTRA_CLIENT_ID', '').strip().lower()     # the app registration's client ID
+ENTRA_SCOPE     = os.environ.get('ENTRA_SCOPE',     'access_as_user').strip()
+ENTRA_ENABLED   = bool(ENTRA_TENANT_ID and ENTRA_CLIENT_ID)
+ENTRA_ISSUER    = f'https://login.microsoftonline.com/{ENTRA_TENANT_ID}/v2.0'
+ENTRA_JWKS_URL  = f'https://login.microsoftonline.com/{ENTRA_TENANT_ID}/discovery/v2.0/keys'
+CLOCK_SKEW_SECONDS = 300    # tolerance for "not before" between Microsoft's clock and ours
+
 # PKCS#1 v1.5 DigestInfo prefix for SHA-256 (RFC 8017, section 9.2)
 SHA256_DIGEST_INFO = bytes.fromhex('3031300d060960864801650304020105000420')
 
@@ -27,7 +48,8 @@ SHA256_DIGEST_INFO = bytes.fromhex('3031300d060960864801650304020105000420')
 # Who may call which route — for people signing in with a token.
 # A call with the API key is trusted on every route and never looks at this table.
 # A route that is not in this table is refused for token callers (so a new route is closed until
-# it is listed here). The group names are the portal groups; users-api repeats the user rules
+# it is listed here). The group names are the portal's Cognito groups, or for an Entra ID sign-in
+# the app roles with the same value (e.g. SUPER_ADMIN); users-api repeats the user rules
 # and adds the finer ones (own account, which fields) that need the request body.
 # -------------------------------------------------------
 SUPER_ADMIN = 'SUPER_ADMIN'
@@ -73,40 +95,40 @@ ROUTE_GROUPS = {
 
 JWKS_REFETCH_MIN_SECONDS = 60   # an unknown key id may be a rotation — but never refetch on every request
 
-# kept across warm invocations
-_jwks_cache      = None
-_jwks_fetched_at = 0.0
+# kept across warm invocations: key set URL -> { 'keys': {...} or None, 'at': time of last fetch }
+_jwks = {}
 
 
 def b64url_decode(segment):
     return base64.urlsafe_b64decode(segment + '=' * (-len(segment) % 4))
 
 
-def fetch_jwks():
-    global _jwks_cache, _jwks_fetched_at
-    _jwks_fetched_at = time.time()
+def fetch_jwks(url):
+    entry = _jwks.setdefault(url, { 'keys': None, 'at': 0.0 })
+    entry['at'] = time.time()
     try:
-        with urllib.request.urlopen(JWKS_URL, timeout=5) as response:
-            _jwks_cache = json.loads(response.read().decode())
-        print(f"[JWKS] Loaded {len(_jwks_cache.get('keys', []))} keys")
+        with urllib.request.urlopen(url, timeout=5) as response:
+            entry['keys'] = json.loads(response.read().decode())
+        print(f"[JWKS] Loaded {len(entry['keys'].get('keys', []))} keys from {url.split('/')[2]}")
     except Exception as e:
-        print(f'[JWKS] Fetch failed: {e}')
-    return _jwks_cache
+        print(f'[JWKS] Fetch failed ({url.split("/")[2]}): {e}')
+    return entry['keys']
 
 
-def find_key(kid):
-    """Public key for this key id. An unknown id triggers (at most one per minute) refetch,
-    because Cognito rotates its keys. If the key set cannot be had, there is no key —
-    and no key means the token is refused (fail closed)."""
-    jwks = _jwks_cache or fetch_jwks()
+def find_key(url, kid):
+    """Public key for this key id, from the key set at url. An unknown id triggers (at most one per
+    minute) refetch, because Cognito and Microsoft rotate their keys. If the key set cannot be had,
+    there is no key — and no key means the token is refused (fail closed)."""
+    entry = _jwks.get(url)
+    jwks  = entry['keys'] if entry and entry['keys'] else fetch_jwks(url)
     for attempt in (1, 2):
         for key in (jwks or {}).get('keys', []):
             if key.get('kid') == kid:
                 return key
         if attempt == 1:
-            if time.time() - _jwks_fetched_at < JWKS_REFETCH_MIN_SECONDS:
+            if time.time() - _jwks[url]['at'] < JWKS_REFETCH_MIN_SECONDS:
                 break
-            jwks = fetch_jwks()
+            jwks = fetch_jwks(url)
     return None
 
 
@@ -149,8 +171,18 @@ def validate_jwt(token):
     if header.get('alg') != 'RS256':
         return { 'valid': False, 'error': f"Unsupported algorithm: {header.get('alg')}" }
 
-    # 2. signature, against Cognito's public key (fail closed if the key cannot be had)
-    key = find_key(header.get('kid'))
+    # 2. which sign-in issued it? Only the issuer picks the key set; nothing in the token is
+    #    trusted until the signature has been checked against that issuer's own keys.
+    iss = payload.get('iss')
+    if ACCEPT_COGNITO_TOKENS and iss == ISSUER:
+        kind, jwks_url = 'cognito', JWKS_URL
+    elif ENTRA_ENABLED and isinstance(iss, str) and iss.lower() == ENTRA_ISSUER:
+        kind, jwks_url = 'entra', ENTRA_JWKS_URL
+    else:
+        return { 'valid': False, 'error': 'Invalid issuer' }
+
+    # 3. signature, against that issuer's public key (fail closed if the key cannot be had)
+    key = find_key(jwks_url, header.get('kid'))
     if not key:
         return { 'valid': False, 'error': 'Signing key not found or key set unavailable' }
     try:
@@ -161,14 +193,17 @@ def validate_jwt(token):
     if not verify_rs256(f'{parts[0]}.{parts[1]}'.encode('utf-8'), signature, n, e):
         return { 'valid': False, 'error': 'Signature invalid' }
 
-    # 3. claims — only trusted now that the signature checks out
+    # 4. claims — only trusted now that the signature checks out
     exp = payload.get('exp')
     if not isinstance(exp, (int, float)) or exp < time.time():
         return { 'valid': False, 'error': 'Token expired' }
 
-    if payload.get('iss') != ISSUER:
-        return { 'valid': False, 'error': 'Invalid issuer' }
+    if kind == 'entra':
+        return entra_claims(payload)
+    return cognito_claims(payload)
 
+
+def cognito_claims(payload):
     token_use = payload.get('token_use')
     if token_use not in ('id', 'access'):
         return { 'valid': False, 'error': 'Invalid token_use' }
@@ -188,6 +223,39 @@ def validate_jwt(token):
     raw_groups = payload.get('cognito:groups')
     groups     = [g for g in raw_groups if isinstance(g, str)] if isinstance(raw_groups, list) else []
     return { 'valid': True, 'principal': principal, 'groups': groups }
+
+
+def entra_claims(payload):
+    """An Entra ID access token for our app registration. The signature, issuer and expiry are
+    already checked. An ID token, or an access token for another API (e.g. Microsoft Graph), fails
+    the audience or scope check."""
+    if payload.get('ver') != '2.0':
+        return { 'valid': False, 'error': 'Entra token is not version 2.0' }
+
+    nbf = payload.get('nbf')
+    if isinstance(nbf, (int, float)) and nbf > time.time() + CLOCK_SKEW_SECONDS:
+        return { 'valid': False, 'error': 'Entra token not valid yet' }
+
+    if str(payload.get('tid', '')).lower() != ENTRA_TENANT_ID:
+        return { 'valid': False, 'error': 'Entra token from another tenant' }
+
+    if str(payload.get('aud', '')).lower() != ENTRA_CLIENT_ID:
+        return { 'valid': False, 'error': 'Entra token was issued for another app' }
+
+    scopes = payload.get('scp')
+    if not isinstance(scopes, str) or ENTRA_SCOPE not in scopes.split():
+        return { 'valid': False, 'error': f'Entra token lacks the {ENTRA_SCOPE} scope' }
+
+    principal = (
+        payload.get('email') or
+        payload.get('preferred_username') or
+        payload.get('oid') or
+        'entra-user'
+    )
+    # the app roles assigned to the employee in the enterprise application (e.g. SUPER_ADMIN)
+    raw_roles = payload.get('roles')
+    roles     = [r for r in raw_roles if isinstance(r, str)] if isinstance(raw_roles, list) else []
+    return { 'valid': True, 'principal': principal, 'groups': roles }
 
 
 def lambda_handler(event, context):

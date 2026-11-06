@@ -1,6 +1,8 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { getApiHeaders }                       from '../../hooks/useAuth';
 import { formatDate }                           from '../../utils/dates';
+import { friendlyError, networkError, readJson } from '../../utils/api';
+import { useToast }                             from '../../components/Toast';
 
 const API_URL = process.env.REACT_APP_API_URL;
 const PAGE_SIZE = 10;
@@ -9,6 +11,11 @@ const PERMANENT_REPORTS = [
   { id: 'users',              label: 'All Users',          endpoint: '/reports/users',              type: 'users',   description: 'All users with status, organisation and migration info' },
   { id: 'inactive',           label: 'Inactive Users',     endpoint: '/reports/inactive',           type: 'users',   description: 'Users who have never logged in' },
   { id: 'organisations',      label: 'Organisations',      endpoint: '/reports/organisations',      type: 'orgs',    description: 'All broker firms with member counts from Cognito' },
+];
+
+// TEMPORARY — the ForgeRock → Cognito migration, on their own page (Migration in the sidebar).
+// Delete MIGRATION_REPORTS, FORGEROCK_REPORTS and MigrationReportsPage after cutover.
+const MIGRATION_REPORTS = [
   { id: 'migration',          label: 'Migration Report',   endpoint: '/reports/migration',          type: 'users',   description: 'All users with migration status' },
   { id: 'migration-pending',  label: 'Migration Pending',  endpoint: '/reports/migration/pending',  type: 'users',   description: 'Users not yet logged into Cognito' },
   { id: 'migration-complete', label: 'Migration Complete', endpoint: '/reports/migration/complete', type: 'users',   description: 'Users who completed JIT migration' },
@@ -152,8 +159,7 @@ async function downloadCSV(endpoint, params, filename) {
   Object.entries(params).forEach(([k, v]) => { if (v) url.searchParams.append(k, v); });
   url.searchParams.append('format', 'csv');
   const headers  = await getApiHeaders();
-  const response = await fetch(url.toString(), { headers });
-  if (!response.ok) throw new Error(`Server error: ${response.status}`);
+  const response = await reportFetch(url, headers);
   const blob  = await response.blob();
   const link  = document.createElement('a');
   link.href   = URL.createObjectURL(blob);
@@ -168,10 +174,52 @@ async function fetchPreview(endpoint, params) {
   const url = new URL(`${API_URL}${endpoint}`);
   Object.entries(params).forEach(([k, v]) => { if (v) url.searchParams.append(k, v); });
   const headers  = await getApiHeaders();
-  const response = await fetch(url.toString(), { headers });
-  if (!response.ok) throw new Error(`Server error: ${response.status}`);
+  const response = await reportFetch(url, headers);
   return response.json();
 }
+
+// fetch with errors people can read (big reports can take a while: a 504 means "too slow")
+async function reportFetch(url, headers) {
+  let response;
+  try {
+    response = await fetch(url.toString(), { headers });
+  } catch (e) {
+    throw networkError(e);
+  }
+  if (!response.ok) {
+    const data = await readJson(response);
+    throw new Error(response.status === 504
+      ? 'The report took too long to build. Narrow it down with filters (organisation or dates) and try again.'
+      : friendlyError(response.status, data, "Couldn't load the report."));
+  }
+  return response;
+}
+
+// -------------------------------------------------------
+// The filters in words, e.g. "Organisation: AIS001, Status: Active" — for the chips above the
+// reports and the line under each result
+// -------------------------------------------------------
+const labelOf = (options, value) => options.find(o => o.value === value)?.label || value;
+
+function describeFilters(filters, orgOptions = []) {
+  const chips = [];
+  if (filters.organisations.length) chips.push({ key: 'organisations', text: `Organisation: ${filters.organisations.map(v => labelOf(orgOptions, v)).join(', ')}` });
+  if (filters.statuses.length)      chips.push({ key: 'statuses',      text: `Status: ${filters.statuses.map(v => labelOf(STATUS_OPTIONS, v)).join(', ')}` });
+  if (filters.countries.length)     chips.push({ key: 'countries',     text: `Country: ${filters.countries.map(v => labelOf(COUNTRY_OPTIONS, v)).join(', ')}` });
+  if (filters.search)               chips.push({ key: 'search',        text: `Search: "${filters.search}"` });
+  if (filters.fromDate || filters.toDate) {
+    chips.push({ key: 'created', text: `Created: ${filters.fromDate || 'any'} → ${filters.toDate || 'today'}` });
+  }
+  if (filters.lastLoginFrom || filters.lastLoginTo) {
+    chips.push({ key: 'lastLogin', text: `Last login: ${filters.lastLoginFrom || 'any'} → ${filters.lastLoginTo || 'today'}` });
+  }
+  return chips;
+}
+
+const CLEARED = {
+  organisations: { organisations: [] }, statuses: { statuses: [] }, countries: { countries: [] },
+  search: { search: '' }, created: { fromDate: '', toDate: '' }, lastLogin: { lastLoginFrom: '', lastLoginTo: '' },
+};
 
 function getColumns(report, rows) {
   if (!rows || rows.length === 0) return [];
@@ -297,7 +345,9 @@ function PreviewTable({ report, rows, columns, page, setPage, total }) {
   );
 }
 
-function ReportSection({ report, filters }) {
+function ReportSection({ report, filters, orgOptions }) {
+  const toast = useToast();
+  const [ranWith, setRanWith] = useState(null);   // { at, filters } of the result on screen
   const [state,     setState]     = useState('idle');
   const [data,      setData]      = useState(null);
   const [error,     setError]     = useState('');
@@ -318,6 +368,7 @@ function ReportSection({ report, filters }) {
       const params = buildParams(report, filters);
       const result = await fetchPreview(report.endpoint, params);
       setData(result);
+      setRanWith({ at: new Date(), summary: describeFilters(filters, orgOptions).map(c => c.text).join(' · ') });
       setState('done');
     } catch (e) {
       setError(e.message);
@@ -331,12 +382,15 @@ function ReportSection({ report, filters }) {
     try {
       const params   = buildParams(report, filters);
       const date     = new Date().toISOString().slice(0, 10);
-      await downloadCSV(report.endpoint, params, `${report.id}-${date}.csv`);
+      const file     = `${report.id}-${date}.csv`;
+      await downloadCSV(report.endpoint, params, file);
       setDlState('done');
+      toast(`${report.label} downloaded as ${file}`);
       setTimeout(() => setDlState('idle'), 3000);
     } catch (e) {
       setDlError(e.message);
       setDlState('error');
+      toast(`${report.label}: download failed`, 'error');
     }
   };
 
@@ -388,14 +442,25 @@ function ReportSection({ report, filters }) {
           {dlError && <div style={{ padding: '10px 18px', color: '#991b1b', background: '#fee2e2', fontSize: 13 }}>{dlError}</div>}
 
           {state === 'loading' && (
-            <div style={{ padding: '24px', textAlign: 'center', color: 'var(--text-muted)', fontSize: 13 }}>
-              Loading data...
+            <div className="table-skeleton" aria-busy="true">
+              <span className="visually-hidden">Loading report…</span>
+              {Array.from({ length: 5 }, (_, i) => (
+                <span key={i} className="skeleton skeleton-line" aria-hidden="true" style={{ width: `${70 + (i * 9) % 30}%` }} />
+              ))}
             </div>
           )}
 
           {state === 'done' && rows.length === 0 && (
             <div style={{ padding: '24px', textAlign: 'center', color: 'var(--text-muted)', fontSize: 13 }}>
               No results found for the selected filters
+            </div>
+          )}
+
+          {state === 'done' && ranWith && (
+            <div className="report-meta">
+              {rows.length.toLocaleString()} row{rows.length === 1 ? '' : 's'} · run at{' '}
+              {ranWith.at.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+              {' · '}{ranWith.summary || 'no filters'}
             </div>
           )}
 
@@ -415,7 +480,13 @@ function ReportSection({ report, filters }) {
   );
 }
 
-export default function ReportsPage() {
+// The Migration page: the same filters and report cards, with the temporary reports only
+export function MigrationReportsPage() {
+  return <ReportsPage variant="migration" />;
+}
+
+export default function ReportsPage({ variant = 'main' }) {
+  const isMigration = variant === 'migration';
   const [filters, setFilters] = useState({
     organisations: [], statuses: [], countries: [],
     fromDate: '', toDate: '', lastLoginFrom: '', lastLoginTo: '', search: ''
@@ -431,7 +502,7 @@ export default function ReportsPage() {
     try {
       const headers = await getApiHeaders();
       const r       = await fetch(`${API_URL}/broker-firms`, { headers });
-      if (!r.ok) throw new Error(`Server error: ${r.status}`);
+      if (!r.ok) throw new Error(friendlyError(r.status, await readJson(r), "Couldn't load organisations."));
       const data    = await r.json();
       // handle array or object response
       const firms   = Array.isArray(data) ? data : (data.firms || data.items || []);
@@ -455,6 +526,7 @@ export default function ReportsPage() {
   const set   = (key, val) => setFilters(prev => ({ ...prev, [key]: val }));
   const clear = () => setFilters({ organisations: [], statuses: [], countries: [], fromDate: '', toDate: '', lastLoginFrom: '', lastLoginTo: '', search: '' });
 
+  const chips = describeFilters(filters, orgOptions);
   const activeCount = (
     filters.organisations.length + filters.statuses.length + filters.countries.length +
     (filters.fromDate ? 1 : 0) + (filters.toDate ? 1 : 0) +
@@ -465,10 +537,16 @@ export default function ReportsPage() {
   return (
     <div className="page">
 
-      <p className="page-intro-text">
-        Set filters if you need them, then run a report to preview it, or download it as a CSV file.
-        Filters apply to every report below except the temporary ForgeRock ones.
-      </p>
+      {isMigration ? (
+        <div className="page-notice">
+          <strong>Temporary.</strong> These reports track the ForgeRock → Cognito migration and will be
+          removed after cutover. Filters apply to the migration reports, not the ForgeRock ones.
+        </div>
+      ) : (
+        <p className="page-intro-text">
+          Set filters if you need them, then run a report to preview it, or download it as a CSV file.
+        </p>
+      )}
 
       <div className="filter-panel">
         <div className="filter-header">
@@ -565,24 +643,51 @@ export default function ReportsPage() {
         </div>
       </div>
 
-      <div className="section-header">
-        <span className="section-title">Choose a report</span>
-      </div>
-      <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
-        {PERMANENT_REPORTS.map(r => (
-          <ReportSection key={r.id} report={r} filters={filters} />
-        ))}
-      </div>
+      {chips.length > 0 && (
+        <div className="filter-chips" aria-label="Active filters">
+          <span className="filter-chips-label">Filtering by</span>
+          {chips.map(c => (
+            <span key={c.key} className="filter-chip">
+              {c.text}
+              <button type="button" className="filter-chip-x" aria-label={`Remove filter ${c.text}`}
+                      onClick={() => setFilters(prev => ({ ...prev, ...CLEARED[c.key] }))}>×</button>
+            </span>
+          ))}
+        </div>
+      )}
 
-      <div className="section-header">
-        <span className="section-title">ForgeRock Reports</span>
-        <span className="section-badge">Temporary — remove after cutover</span>
-      </div>
-      <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
-        {FORGEROCK_REPORTS.map(r => (
-          <ReportSection key={r.id} report={r} filters={filters} />
-        ))}
-      </div>
+      {isMigration ? (
+        <>
+          <div className="section-header">
+            <span className="section-title">JIT migration</span>
+          </div>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+            {MIGRATION_REPORTS.map(r => (
+              <ReportSection key={r.id} report={r} filters={filters} orgOptions={orgOptions} />
+            ))}
+          </div>
+
+          <div className="section-header">
+            <span className="section-title">ForgeRock</span>
+          </div>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+            {FORGEROCK_REPORTS.map(r => (
+              <ReportSection key={r.id} report={r} filters={filters} orgOptions={orgOptions} />
+            ))}
+          </div>
+        </>
+      ) : (
+        <>
+          <div className="section-header">
+            <span className="section-title">Choose a report</span>
+          </div>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+            {PERMANENT_REPORTS.map(r => (
+              <ReportSection key={r.id} report={r} filters={filters} orgOptions={orgOptions} />
+            ))}
+          </div>
+        </>
+      )}
 
     </div>
   );

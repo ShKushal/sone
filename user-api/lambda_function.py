@@ -897,7 +897,11 @@ ROUTE_POLICY = {
 POLICY_GROUPS = set().union(*(allowed for allowed, _ in ROUTE_POLICY.values()))
 
 def caller_identity(event):
-    """Who is calling, from the token in the Authorization header. None = no user token (API key)."""
+    """Who is calling, from the token in the Authorization header. None = no user token (API key).
+
+    The token is either a Cognito token (the portal's old sign-in) or a Microsoft Entra ID access
+    token (employees signing in with MSAL). For Entra, the app roles ("roles", e.g. SUPER_ADMIN)
+    take the place of the Cognito groups, and the sign-in name stands in when there is no email."""
     headers = event.get('headers') or {}
     auth    = headers.get('authorization') or headers.get('Authorization') or ''
     if not auth.lower().startswith('bearer '):
@@ -905,13 +909,14 @@ def caller_identity(event):
     try:
         payload_b64 = auth.split(' ', 1)[1].split('.')[1]
         payload     = json.loads(base64.urlsafe_b64decode(payload_b64 + '=' * (-len(payload_b64) % 4)))
-        groups      = payload.get('cognito:groups') or []
+        groups      = payload.get('cognito:groups') or payload.get('roles') or []
     except Exception:
         return { 'groups': [], 'username': '', 'email': '', 'sub': '' }     # unreadable → nobody → denied
     return {
         'groups':   [groups] if isinstance(groups, str) else list(groups),
-        'username': str(payload.get('cognito:username') or payload.get('username') or ''),
-        'email':    str(payload.get('email') or ''),
+        'username': str(payload.get('cognito:username') or payload.get('username')
+                        or payload.get('preferred_username') or ''),
+        'email':    str(payload.get('email') or payload.get('preferred_username') or ''),
         'sub':      str(payload.get('sub') or ''),
     }
 

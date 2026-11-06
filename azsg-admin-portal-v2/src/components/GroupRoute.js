@@ -4,19 +4,16 @@ import { getUserGroups }               from '../hooks/useAuth';
 import GROUPS, { hasGroupAccess }      from '../config/groups';
 
 /**
- * Protects a route by Cognito group.
- * Only allows access if group exists in GROUPS config
- * AND user is a member of that group (or is a SUPER_ADMIN).
+ * Protects a route by portal group.
+ * Only allows access if the group exists in the GROUPS config
+ * AND the user holds that group (or is a SUPER_ADMIN).
  */
 export default function GroupRoute({ group, children }) {
   const [allowed,  setAllowed]  = useState(null);
   const [checking, setChecking] = useState(true);
 
   useEffect(() => {
-    // check group exists in config
-    const groupExists = Object.values(GROUPS).some(g => g.name === group);
-
-    if (!groupExists) {
+    if (!GROUPS[group]) {
       setAllowed(false);
       setChecking(false);
       return;

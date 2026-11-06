@@ -9,6 +9,14 @@ const SHAPES = {
   logout:   <><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4" /><path d="M16 17l5-5-5-5" /><path d="M21 12H9" /></>,
   user:     <><circle cx="12" cy="8" r="4" /><path d="M4 21a8 8 0 0 1 16 0" /></>,
   alert:    <><path d="M12 3l10 18H2L12 3z" /><path d="M12 10v5" /><path d="M12 18.2v.1" /></>,
+  search:   <><circle cx="11" cy="11" r="7" /><path d="M20 20l-3.5-3.5" /></>,
+  enter:    <><path d="M20 5v7a3 3 0 0 1-3 3H5" /><path d="M9 11l-4 4 4 4" /></>,
+  menu:     <><path d="M4 6h16" /><path d="M4 12h16" /><path d="M4 18h16" /></>,
+  close:    <><path d="M6 6l12 12" /><path d="M18 6L6 18" /></>,
+  copy:     <><rect x="9" y="9" width="11" height="11" rx="2" /><path d="M5 15V6a2 2 0 0 1 2-2h9" /></>,
+  link:     <><path d="M10 14a4 4 0 0 0 5.7 0l3-3a4 4 0 0 0-5.7-5.7l-1 1" /><path d="M14 10a4 4 0 0 0-5.7 0l-3 3a4 4 0 0 0 5.7 5.7l1-1" /></>,
+  clock:    <><circle cx="12" cy="12" r="9" /><path d="M12 7v5l3 2" /></>,
+  migrate:  <><path d="M4 7h13" /><path d="M14 4l3 3-3 3" /><path d="M20 17H7" /><path d="M10 14l-3 3 3 3" /></>,
 };
 
 /**

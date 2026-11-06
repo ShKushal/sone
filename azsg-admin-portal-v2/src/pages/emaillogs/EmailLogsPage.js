@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { getApiHeaders }                                    from '../../hooks/useAuth';
+import { friendlyError, networkError } from '../../utils/api';
 import { formatDateTime, formatTimeOfDay }                  from '../../utils/dates';
 
 const API_URL = process.env.REACT_APP_API_URL;
@@ -54,13 +55,18 @@ function buildParams({ statuses, search, range, from, to }) {
 
 async function fetchEmailLogs(params) {
   const headers  = await getApiHeaders();
-  const response = await fetch(`${API_URL}/email-logs?${params}`, { headers });
+  let response;
+  try {
+    response = await fetch(`${API_URL}/email-logs?${params}`, { headers });
+  } catch (e) {
+    throw networkError(e);
+  }
   let data = null;
   try { data = await response.json(); } catch { /* reported below */ }
 
   if (!response.ok) {
     if (response.status === 403) throw new Error('You do not have access to the email logs.');
-    throw new Error(data?.errors?.[0] || data?.error || `Server error: ${response.status}`);
+    throw new Error(friendlyError(response.status, data, "Couldn't load the email logs."));
   }
   return data || {};
 }

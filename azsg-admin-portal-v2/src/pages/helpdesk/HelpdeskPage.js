@@ -3,7 +3,9 @@ import { getApiHeaders, getCurrentUser } from '../../hooks/useAuth';
 import GROUPS, { isSuperAdmin, SUPER_ADMIN } from '../../config/groups';
 import DateTime                          from '../../components/DateTime';
 import Icon                              from '../../components/Icon';
-import { fetchAuthSession }            from 'aws-amplify/auth';
+import { useLocation }                   from 'react-router-dom';
+import { apiFetch }                      from '../../utils/api';
+import { useToast }                      from '../../components/Toast';
 
 const API_URL  = process.env.REACT_APP_API_URL;
 const PER_PAGE = 10;
@@ -58,27 +60,22 @@ function emailStatus(attrs = {}) {
 // API helpers
 // -------------------------------------------------------
 
-// The Lambdas answer failures with { errors: [...] } (older checks use { error })
-function errorMessage(data, fallback) {
-  return data?.errors?.[0] || data?.error || fallback;
-}
-
+// For the audit fields. The API records the verified caller from the token itself; this is only
+// what the request says, kept for API-key callers that have no token.
 async function getTriggeredBy() {
   try {
-    const session = await fetchAuthSession();
-    return session.tokens?.idToken?.payload?.email || '';
+    return (await getCurrentUser()).email || '';
   } catch { return ''; }
 }
 
+const userUrl = (username, suffix = '') => `${API_URL}/users/${encodeURIComponent(username)}${suffix}`;
+
+// null when there is no such user
 async function apiSearchUser(username) {
-  const headers  = await getApiHeaders();
-  const response = await fetch(
-    `${API_URL}/users/${encodeURIComponent(username)}`,
-    { headers }
-  );
-  if (response.status === 404) return null;
-  if (!response.ok) throw new Error(`Server error: ${response.status}`);
-  return response.json();
+  const headers = await getApiHeaders();
+  const { status, data } = await apiFetch(userUrl(username), { headers },
+    { fallback: "Couldn't load this user.", allow: [404] });
+  return status === 404 ? null : data;
 }
 
 async function apiListUsers(limit, paginationToken) {
@@ -86,83 +83,37 @@ async function apiListUsers(limit, paginationToken) {
   const url     = new URL(`${API_URL}/users`);
   url.searchParams.append('limit', limit);
   if (paginationToken) url.searchParams.append('paginationToken', paginationToken);
-  const response = await fetch(url.toString(), { headers });
-  if (!response.ok) throw new Error(`Server error: ${response.status}`);
-  return response.json();
+  return (await apiFetch(url.toString(), { headers }, { fallback: "Couldn't load the user list." })).data;
 }
 
-async function apiResetPassword(username, triggeredBy) {
-  const headers  = await getApiHeaders();
-  const response = await fetch(
-    `${API_URL}/users/${encodeURIComponent(username)}/reset-password`,
-    { method: 'POST', headers, body: JSON.stringify({ triggeredBy }) }
-  );
-  const data = await response.json();
-  if (!response.ok) throw new Error(errorMessage(data, 'Reset failed'));
-  return data;
+async function apiSend(url, method, body, fallback) {
+  const headers = await getApiHeaders();
+  return (await apiFetch(url, { method, headers, body: JSON.stringify(body) }, { fallback })).data;
 }
 
-async function apiToggleUser(username, enable, triggeredBy) {
-  const headers  = await getApiHeaders();
-  const response = await fetch(
-    `${API_URL}/users/${encodeURIComponent(username)}`,
-    {
-      method:  'PUT',
-      headers,
-      body:    JSON.stringify({ frUnindexedString1: enable ? 'TRUE' : 'FALSE', triggeredBy })
-    }
-  );
-  const data = await response.json();
-  if (!response.ok) throw new Error(errorMessage(data, 'Update failed'));
-  return data;
-}
+const apiResetPassword = (username, triggeredBy) =>
+  apiSend(userUrl(username, '/reset-password'), 'POST', { triggeredBy }, 'Reset failed.');
+
+const apiToggleUser = (username, enable, triggeredBy) =>
+  apiSend(userUrl(username), 'PUT', { frUnindexedString1: enable ? 'TRUE' : 'FALSE', triggeredBy }, 'Update failed.');
 
 // Changes only the fields it is given (givenName, sn, phoneNumber)
-async function apiUpdateUser(username, fields, triggeredBy) {
-  const headers  = await getApiHeaders();
-  const response = await fetch(`${API_URL}/users/${encodeURIComponent(username)}`, {
-    method: 'PUT',
-    headers,
-    body: JSON.stringify({ ...fields, triggeredBy })
-  });
-  const data = await response.json();
-  if (!response.ok) throw new Error(errorMessage(data, 'Update failed'));
-  return data;
-}
+const apiUpdateUser = (username, fields, triggeredBy) =>
+  apiSend(userUrl(username), 'PUT', { ...fields, triggeredBy }, 'Update failed.');
 
 // The user's Cognito groups, and which of them can be managed here
 async function apiGetUserGroups(username) {
-  const headers  = await getApiHeaders();
-  const response = await fetch(`${API_URL}/users/${encodeURIComponent(username)}/groups`, { headers });
-  const data = await response.json();
-  if (!response.ok) throw new Error(errorMessage(data, 'Could not load groups'));
-  return data;
+  const headers = await getApiHeaders();
+  return (await apiFetch(userUrl(username, '/groups'), { headers }, { fallback: "Couldn't load groups." })).data;
 }
 
 // change = { add: [...], remove: [...] } — portal groups only; the server enforces who may do this
-async function apiUpdateUserGroups(username, change, triggeredBy) {
-  const headers  = await getApiHeaders();
-  const response = await fetch(`${API_URL}/users/${encodeURIComponent(username)}/groups`, {
-    method: 'PUT',
-    headers,
-    body: JSON.stringify({ ...change, triggeredBy })
-  });
-  const data = await response.json();
-  if (!response.ok) throw new Error(errorMessage(data, 'Group update failed'));
-  return data;
-}
+const apiUpdateUserGroups = (username, change, triggeredBy) =>
+  apiSend(userUrl(username, '/groups'), 'PUT', { ...change, triggeredBy }, 'Group update failed.');
 
 // Resets custom:emailFailCount to 0 and custom:emailBlocked to false
-async function apiUnblockEmail(username, triggeredBy) {
-  const headers  = await getApiHeaders();
-  const response = await fetch(
-    `${API_URL}/users/${encodeURIComponent(username)}/email-unblock`,
-    { method: 'POST', headers, body: JSON.stringify({ triggeredBy }) }
-  );
-  const data = await response.json();
-  if (!response.ok) throw new Error(errorMessage(data, 'Unblock failed'));
-  return data;
-}
+const apiUnblockEmail = (username, triggeredBy) =>
+  apiSend(userUrl(username, '/email-unblock'), 'POST', { triggeredBy }, 'Unblock failed.');
 
 async function apiGetEmailLogs(username) {
   try {
@@ -383,6 +334,48 @@ function Row({ label, htmlFor, className, children }) {
 // -------------------------------------------------------
 // User card
 // -------------------------------------------------------
+// A link that opens this user in the Helpdesk. The email goes after "#", which browsers never send
+// to the server, so it stays out of the CDN's access logs.
+const userLink = username =>
+  `${window.location.origin}/helpdesk#user=${encodeURIComponent(username)}`;
+
+// Clipboard API first; if it is refused or never answers (blocked permission, old browser),
+// the classic copy command on a hidden text box
+async function copyText(text) {
+  try {
+    await Promise.race([
+      navigator.clipboard.writeText(text),
+      new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), 1500)),
+    ]);
+    return true;
+  } catch {
+    const box = document.createElement('textarea');
+    box.value = text;
+    box.setAttribute('readonly', '');
+    box.style.position = 'fixed';
+    box.style.opacity  = '0';
+    document.body.appendChild(box);
+    box.select();
+    let ok = false;
+    try { ok = document.execCommand('copy'); } catch { ok = false; }
+    document.body.removeChild(box);
+    return ok;
+  }
+}
+
+function CopyButton({ text, label, done, icon = 'copy' }) {
+  const toast = useToast();
+  const copy  = async () => {
+    if (await copyText(text)) toast(done);
+    else toast("Couldn't copy — select the text and copy it instead.", 'error');
+  };
+  return (
+    <button type="button" className="btn-icon" onClick={copy} title={label} aria-label={label}>
+      <Icon name={icon} size={14} />
+    </button>
+  );
+}
+
 function UserCard({ user, onRefresh }) {
   const [loading,      setLoading]      = useState('');
   const [message,      setMessage]      = useState('');
@@ -575,7 +568,7 @@ function UserCard({ user, onRefresh }) {
 
   const confirmReset = () => setConfirm({
     title:        'Reset password?',
-    body:         `A new password will be generated and emailed directly to ${user.userName}. They can use it to log in immediately.`,
+    body:         `A new password will be generated and emailed to ${user.userName}. Their current password stops working straight away, and they can sign in with the new one immediately.`,
     confirmLabel: 'Reset password',
     danger:       false,
     action:       'Password reset',
@@ -600,7 +593,7 @@ function UserCard({ user, onRefresh }) {
 
   const confirmDisable = () => setConfirm({
     title:        'Disable user?',
-    body:         `${user.userName} will no longer be able to sign in.`,
+    body:         `${user.userName} won't be able to sign in until the account is enabled again. Anyone signed in now stays signed in until their session ends.`,
     confirmLabel: 'Disable user',
     danger:       true,
     action:       'Disable',
@@ -700,7 +693,11 @@ function UserCard({ user, onRefresh }) {
               {attrs.given_name || ''} {attrs.family_name || ''}
               {!attrs.given_name && !attrs.family_name && user.userName}
             </div>
-            <div className="user-email-text">{user.userName}</div>
+            <div className="user-email-row">
+              <span className="user-email-text">{user.userName}</span>
+              <CopyButton text={user.userName} label="Copy email" done="Email copied" />
+              <CopyButton text={userLink(user.userName)} label="Copy link to this user" done="Link copied — it opens this user in the Helpdesk" icon="link" />
+            </div>
           </div>
           <div className="user-badges">
             <span className={`badge ${isEnabled ? 'badge-green' : 'badge-red'}`}>
@@ -879,7 +876,7 @@ function UserCard({ user, onRefresh }) {
           )}
           {groupsInfo?.error && (
             <div className="field-hint" role="alert">
-              Could not load groups: {groupsInfo.error}{' '}
+              {groupsInfo.error}{' '}
               <button type="button" className="btn-link" onClick={retryGroups}>Retry</button>
             </div>
           )}
@@ -1050,9 +1047,7 @@ function UserList({ onSelect, selectedUser }) {
         <div className="search-error" style={{ margin: '8px 0' }}>{error}</div>
       )}
 
-      {loading && (
-        <div className="loading" style={{ padding: '24px' }}>Loading...</div>
-      )}
+      {loading && <ListSkeleton rows={6} />}
 
       {!loading && users.map(listed => {
         // the selected row uses the freshest copy (after unblock / enable / disable)
@@ -1120,11 +1115,68 @@ function UserList({ onSelect, selectedUser }) {
 // -------------------------------------------------------
 // Main Helpdesk Page
 // -------------------------------------------------------
+// Placeholder rows shaped like the real list while it loads
+function ListSkeleton({ rows = 6 }) {
+  return (
+    <div className="list-skeleton" aria-busy="true">
+      <span className="visually-hidden">Loading…</span>
+      {Array.from({ length: rows }, (_, i) => (
+        <div className="list-skeleton-row" key={i} aria-hidden="true">
+          <div className="list-skeleton-text">
+            <span className="skeleton skeleton-line" style={{ width: `${55 + (i * 7) % 30}%` }} />
+            <span className="skeleton skeleton-line skeleton-line-sm" style={{ width: `${40 + (i * 11) % 35}%` }} />
+          </div>
+          <span className="skeleton skeleton-chip" />
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function CardSkeleton() {
+  return (
+    <div className="user-card card-skeleton" aria-busy="true">
+      <span className="visually-hidden">Loading user…</span>
+      <div aria-hidden="true">
+        <span className="skeleton skeleton-line skeleton-line-lg" style={{ width: '40%' }} />
+        <span className="skeleton skeleton-line skeleton-line-sm" style={{ width: '30%' }} />
+        <div className="card-skeleton-grid">
+          {Array.from({ length: 6 }, (_, i) => (
+            <span key={i} className="skeleton skeleton-line" style={{ width: `${50 + (i * 13) % 40}%` }} />
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// -------------------------------------------------------
+// Recent lookups — the last few users opened, in this browser tab only (sessionStorage: gone when
+// the tab closes, never shared with anyone else)
+// -------------------------------------------------------
+const RECENT_KEY = 'helpdesk.recent';
+const RECENT_MAX = 5;
+
+function readRecent() {
+  try { return JSON.parse(sessionStorage.getItem(RECENT_KEY)) || []; } catch { return []; }
+}
+function rememberRecent(username) {
+  const list = [username, ...readRecent().filter(u => u.toLowerCase() !== username.toLowerCase())].slice(0, RECENT_MAX);
+  try { sessionStorage.setItem(RECENT_KEY, JSON.stringify(list)); } catch { /* storage off: no list */ }
+  return list;
+}
+
+// -------------------------------------------------------
+// Main Helpdesk Page
+// -------------------------------------------------------
 export default function HelpdeskPage() {
+  const location = useLocation();
   const [searchEmail,  setSearchEmail]  = useState('');
   const [selectedUser, setSelectedUser] = useState(null);
   const [loadingUser,  setLoadingUser]  = useState(false);
   const [error,        setError]        = useState('');
+  const [notFound,     setNotFound]     = useState('');
+  const [recent,       setRecent]       = useState(readRecent);
 
   const latestRequest = useRef('');   // newest requested username — older responses are ignored
 
@@ -1132,11 +1184,17 @@ export default function HelpdeskPage() {
   // during the reload and its action message disappears as soon as it appears.
   const loadUser = async (username, { silent = false } = {}) => {
     latestRequest.current = username;
-    if (!silent) { setLoadingUser(true); setError(''); }
+    if (!silent) { setLoadingUser(true); setError(''); setNotFound(''); }
     try {
       const result = await apiSearchUser(username);
       if (latestRequest.current !== username) return true;   // switched to another user meanwhile
+      if (!result && !silent) {
+        setSelectedUser(null);
+        setNotFound(username);
+        return true;
+      }
       setSelectedUser(result);
+      if (result && !silent) setRecent(rememberRecent(result.userName || username));
       return true;
     } catch (e) {
       if (latestRequest.current !== username) return true;
@@ -1148,6 +1206,21 @@ export default function HelpdeskPage() {
       if (!silent && latestRequest.current === username) setLoadingUser(false);
     }
   };
+
+  // Opened with a user to show: from the search box (Ctrl K, router state) or a copied link
+  // (#user=…). The link's email is taken off the address bar straight away.
+  useEffect(() => {
+    let wanted = location.state?.lookup;
+    const hash = new URLSearchParams(window.location.hash.slice(1)).get('user');
+    if (hash) {
+      wanted = hash;
+      window.history.replaceState(window.history.state, '', window.location.pathname);
+    }
+    if (wanted) {
+      setSearchEmail(wanted);
+      loadUser(wanted);
+    }
+  }, [location.key]);
 
   const handleSearch = async (e) => {
     e.preventDefault();
@@ -1177,14 +1250,32 @@ export default function HelpdeskPage() {
             onChange={e => setSearchEmail(e.target.value)}
             placeholder="Search by email address"
             className="search-input"
+            aria-label="Email address"
           />
           <button type="submit" className="btn-search" disabled={loadingUser}>
             {loadingUser ? 'Loading...' : 'Search'}
           </button>
         </form>
+
+        {recent.length > 0 && (
+          <div className="recent-row">
+            <span className="recent-label">Recent</span>
+            {recent.map(u => (
+              <button key={u} type="button" className="recent-chip"
+                      onClick={() => { setSearchEmail(u); loadUser(u); }}>
+                {u}
+              </button>
+            ))}
+          </div>
+        )}
       </div>
 
-      {error && <div className="search-error">{error}</div>}
+      {error && <div className="search-error" role="alert">{error}</div>}
+      {notFound && (
+        <div className="search-notfound" role="status">
+          No user found for <strong>{notFound}</strong>. Check the spelling — the search needs the full email address.
+        </div>
+      )}
 
       {/* Two column layout */}
       <div className="helpdesk-layout">
@@ -1197,9 +1288,7 @@ export default function HelpdeskPage() {
 
         {/* Right — user detail */}
         <div className="helpdesk-detail">
-          {loadingUser && (
-            <div className="loading">Loading user...</div>
-          )}
+          {loadingUser && <CardSkeleton />}
 
           {!loadingUser && !selectedUser && (
             <div className="helpdesk-empty">
